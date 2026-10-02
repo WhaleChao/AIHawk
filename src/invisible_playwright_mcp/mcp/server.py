@@ -164,8 +164,9 @@ through the real pointer and the real keyboard.
 Try things in this order. It matters, because a page can tell the difference.
 
 1. A named tool with a selector: browser_click, browser_type,
-   browser_select_option, browser_press_key. browser_snapshot gives you the
-   selector for each element - pass it verbatim, it is built to be unambiguous.
+   browser_select_option, browser_press_key, browser_upload_files.
+   browser_snapshot gives you the selector for each element - pass it
+   verbatim, it is built to be unambiguous.
 
 2. Coordinates. browser_snapshot reports `at: [x, y]` for every element it
    lists, in viewport pixels. browser_click_at takes exactly those and moves the
@@ -471,7 +472,7 @@ async def browser_read_text(selector: str = "body",
     # written twice gets a GATE, not a deletion: `test_the_cap_in_the_prose_is
     # _the_cap_the_tool_uses` ties this digit to the constant, so the copy
     # cannot drift even though it stays.
-    return await work.acting(actions.read_text, selector, max_chars, role=browser)
+    return await work.reading(actions.read_text, selector, max_chars, role=browser)
 
 
 @mcp.tool(annotations=_says("Snapshot the page", read_only=True))
@@ -503,7 +504,7 @@ async def browser_snapshot(max_chars: int = 0, browser: Browser = None) -> str:
     # once and updated once, and the copy that stays wrong is the one a model
     # reads. It also spends the 1024 characters this description is cut at on
     # evidence for a reader who is not there.
-    return await work.acting(actions.snapshot, max_chars, role=browser)
+    return await work.reading(actions.snapshot, max_chars, role=browser)
 
 
 @mcp.tool(annotations=_says("Read the page HTML", read_only=True))
@@ -523,13 +524,13 @@ async def browser_read_html(mode: str = "form", browser: Browser = None) -> str:
     middle leaves tags that mean nothing, so it is not cut - but the answer can
     be long. Reach for browser_snapshot when you only need something to click.
     """
-    return await work.acting(actions.read_html, mode, role=browser)
+    return await work.reading(actions.read_html, mode, role=browser)
 
 
 @mcp.tool(annotations=_says("Take a screenshot", read_only=True))
 async def browser_take_screenshot(browser: Browser = None) -> Image:
     """One screenshot of this browser's page, on demand."""
-    png = await work.acting(actions.screenshot_png, role=browser)
+    png = await work.reading(actions.screenshot_png, role=browser)
     return Image(data=png, format="png")
 
 
@@ -549,7 +550,7 @@ async def browser_watch(browser: Browser = None) -> Image:
     # is not a schema pydantic will build - measured, five test modules
     # refuse to import. A refusal reaches a client as an error result
     # carrying the reason, which every client already handles.
-    jpeg = await work.acting(lambda session: session.watch_frame(), role=browser)
+    jpeg = await work.reading(lambda session: session.watch_frame(), role=browser)
     return Image(data=jpeg, format="jpeg")
 
 
@@ -591,12 +592,14 @@ async def browser_click_at(x: float, y: float, hold_seconds: float = 0.0,
 
 @mcp.tool(annotations=_says("Type into a field", destructive=True))
 async def browser_type(selector: str, text: str, browser: Browser = None) -> str:
-    """Fill a field, replacing whatever it holds.
+    """Type into a field, replacing what it holds, key by key at a human pace.
 
-    This sets the value rather than typing key by key, so it will not fire the
-    per-keystroke handlers an autocomplete needs. For those, click the field and
-    use browser_press_key."""
-    return await work.acting(actions.type_text, selector, text, role=browser)
+    The answer says what the field kept: all of it, a maxlength's cut, the
+    page's reformatting, nothing (the page took it out), or one box of a code
+    the page spreads over several. Nothing is retyped on its own. Text too long
+    to finish within one answer goes on in the background; until it ends,
+    actions on that browser are refused with its progress, and reads work."""
+    return await work.typing(actions.type_text, selector, text, role=browser)
 
 
 @mcp.tool(annotations=_says("Choose a dropdown option", destructive=True))
@@ -610,6 +613,23 @@ async def browser_select_option(selector: str, value: str,
     through browser_evaluate changes it without the page seeing a real
     interaction."""
     return await work.acting(actions.select_option, selector, value, role=browser)
+
+
+@mcp.tool(annotations=_says("Upload files", destructive=True))
+async def browser_upload_files(selector: str, paths: list[str],
+                               browser: Browser = None) -> str:
+    """Attach local files to a file input, the way a person picks them.
+
+    `selector` is the `<input type=file>` itself, or the button or label that
+    opens its chooser: that is clicked with the real pointer and the chooser
+    answered with `paths`. A hidden input is opened through its label; with
+    none, pass the button that opens it. Several files need an input that
+    takes several; otherwise upload them one call at a time.
+
+    Each path is absolute and names a regular file inside a directory listed
+    in INVISIBLE_MCP_UPLOAD_DIRS, through no hidden directory; with none
+    listed, uploads are off. Never use browser_evaluate to set `files`."""
+    return await work.acting(actions.upload_files, selector, paths, role=browser)
 
 
 @mcp.tool(annotations=_says("Press a key", destructive=True))
@@ -637,7 +657,7 @@ async def browser_evaluate(expression: str, browser: Browser = None) -> str:
     The refusal catches the obvious spellings, not every possible one. A script
     that slips past it is still the wrong way to do the thing: report it in your
     answer rather than using it."""
-    return await work.acting(actions.evaluate, expression, role=browser)
+    return await work.reading(actions.evaluate, expression, role=browser)
 
 
 def main() -> None:
