@@ -206,21 +206,41 @@ class ChatService:
 
     @property
     def busy(self) -> bool:
-        """Whether an instruction is in flight, for a listener joining now.
+        """Whether an instruction is in flight. The one place that knows.
 
-        The lock and not the task handle: the lock is held for exactly as long
-        as `send` runs, which is the span the page draws as busy, while the
-        handle survives its own task and would answer for a run that ended.
+        ⛔ TWO PLACES ANSWERED THIS, AND FOR A MOMENT THEY DISAGREED. This read
+        the lock, which `send` takes only once its task first runs, and `start`
+        read nothing at all. Between `create_task` and that first step the lock
+        was free while a run was already on its way, so a second `/chat/send`
+        in that window was accepted, its task replaced the handle, and Stop
+        could no longer reach the run driving the browser. The lock alone misses
+        the start of a run; the handle alone would miss a `send` awaited
+        directly, without `start`. So both, here, and every caller - `start`,
+        `reset`, a listener joining - asks this.
+
+        The handle cannot answer for a run that ended: it is asked whether its
+        task is done, and the task finishes in the same step that releases the
+        lock, after the closing `busy 0` and with no await in between.
         """
-        return self._busy.locked()
+        task_alive = self._task is not None and not self._task.done()
+        return task_alive or self._busy.locked()
 
-    def start(self, text: str) -> None:
+    def start(self, text: str) -> bool:
         """Run an instruction detached, keeping the handle so it can be stopped.
 
         The task is held for exactly that reason. Firing and forgetting is one
         line shorter and makes the stop button a decoration.
+
+        Refused, answering False, while another instruction is in flight: two
+        tabs can post before either sees the busy event, and replacing the
+        handle would make Stop cancel the waiting turn while the run already
+        driving the browser carries on. The page queues a refused sentence the
+        way it queues one typed while it already knows the agent is busy.
         """
+        if self.busy:
+            return False
         self._task = asyncio.create_task(self.send(text))
+        return True
 
     def stop(self) -> bool:
         t = self._task

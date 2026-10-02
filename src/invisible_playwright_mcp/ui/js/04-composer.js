@@ -105,10 +105,12 @@ thread.addEventListener('click', (e) => {
    changed, laptop asleep: the instruction was gone and the transcript never
    grew, which reads as the agent ignoring you. */
 async function send(text){
+  const ended = turnsEnded;
   try {
     const r = await door('/chat/send', {method:'POST',
                          headers:{'Content-Type':'application/json'},
                          body: JSON.stringify({text})});
+    if(r.status === 409){ queueBehind(text, ended); return; }
     if(!r.ok) throw new Error('HTTP ' + r.status);
   } catch(err){
     /* Give it back, exactly as it was, and say why - the sentence is the

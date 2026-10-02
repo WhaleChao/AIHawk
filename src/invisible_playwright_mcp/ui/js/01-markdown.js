@@ -177,5 +177,9 @@ const LEAD = /^(I will |I'll |I am |I'm |Let me |Now I will |Now I'll )/i;
 const thread = $('thread'), anchor = $('anchor'), log = $('log');
 let turn = null, live = null, hold = null, n = 0, t0 = 0, timer = 0;
 let busyNow = false, queued = null, quiet = 0;
+/* How many turns this page has seen end. Read by `send` to tell, when the
+   server answers that the conversation is busy, whether that run's end has
+   already been delivered here or is still to come. */
+let turnsEnded = 0;
 let behind = 0, build = '';
 

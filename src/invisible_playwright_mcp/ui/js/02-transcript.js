@@ -43,6 +43,20 @@ function setQueued(text){
 function queuedFromBefore(){
   return carried(qkey());
 }
+/* ⛔ A 409 FROM `/chat/send` IS "ANOTHER INSTRUCTION GOT THERE FIRST", NOT A
+   LOSS. Two tabs can both press Send before either hears the run start; the
+   page said "did not reach the server (HTTP 409) - try again", untrue twice:
+   it arrived, and trying again is refused until the run ends. It is the
+   sentence typed while the agent works, learned a round trip late, so it is
+   queued the same way. The run's `busy 0` rides the stream and can beat this
+   answer here; it ended after the request left, so if a turn has ended since
+   `ended` was read nobody is left to flush the queue, and it is sent now. */
+function queueBehind(text, ended){
+  if(turnsEnded !== ended && !busyNow){ send(text); return; }
+  setQueued(queued ? queued + '\n' + text : text);
+  orphan('said', 'The agent was already working on another instruction in this '
+         + 'conversation, so yours is queued and goes as soon as that one ends.');
+}
 let pend = null, pendTimer = 0;
 
 const dur = ms => ms < 1000 ? Math.round(ms) + 'ms' : (ms/1000).toFixed(1) + 's';

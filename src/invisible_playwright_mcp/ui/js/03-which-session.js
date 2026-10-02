@@ -90,7 +90,7 @@ const onEvent = (e) => {
       busyNow = m.text === '1';
       /* Not on a replay: those events describe a wait that is over. */
       if(busyNow && !r) waiting(); else waited();
-      if(!busyNow){ flush(true, r);
+      if(!busyNow){ turnsEnded++; flush(true, r);
                     /* A turn can end with a step still open: Stop pressed with
                        a click in flight, a run that died, a model that never
                        answered. The row is settled HERE because this is the one

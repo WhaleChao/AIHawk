@@ -230,6 +230,147 @@ async def test_stop_cancels_a_run_in_flight_and_says_so():
     assert not svc._busy.locked()
 
 
+async def test_a_second_start_cannot_replace_the_running_task_handle():
+    """Two tabs can post before either receives the busy event.
+
+    The second request must not replace the handle of the run already using the
+    conversation. Otherwise Stop cancels the waiter and leaves the running
+    browser agent with no handle, so the only control that can end it lies.
+    """
+    brain = HangingBrain()
+    svc = ChatService(FakeLink(), brain)
+
+    svc.start("the run already in flight")
+    await asyncio.wait_for(brain.started.wait(), 2)
+    running = svc._task
+
+    svc.start("a simultaneous request from another tab")
+    replacement = svc._task
+    try:
+        assert replacement is running, (
+            "a second start replaced the running task, so Stop can no longer "
+            "reach the run in flight")
+    finally:
+        for task in {running, replacement}:
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in {running, replacement}
+                               if task is not None), return_exceptions=True)
+
+
+async def test_a_busy_conversation_answers_a_second_send_with_409():
+    """Through the real app and the real protocol, not a hand-built request.
+
+    Both posts go before the first run has taken a single step, which is the
+    window two tabs actually race in: neither has heard `busy 1` yet.
+
+    Known-bad, two: `start` replacing the handle unconditionally (the second
+    post is accepted), and `busy` reading the lock alone (the window is open,
+    because the lock is taken only once the task runs).
+    """
+    import httpx
+
+    brain = HangingBrain()
+    svc = ChatService(FakeLink(), brain)
+    transport = httpx.ASGITransport(app=build_app(around(svc)))
+    try:
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://interface") as client:
+            first = client.post("/chat/send", json={"text": "from one tab"})
+            second = client.post("/chat/send", json={"text": "from the other"})
+            a, b = await asyncio.gather(first, second)
+            assert sorted([a.status_code, b.status_code]) == [200, 409], (
+                "two sends raced and both were %s/%s" % (a.status_code, b.status_code))
+            refused = a if a.status_code == 409 else b
+            assert refused.json() == {"error": "conversation is busy"}
+            await asyncio.wait_for(brain.started.wait(), 2)
+            asked = [e["text"] for e in svc.history if e["kind"] == "you"]
+            assert len(asked) == 1, "both instructions reached the brain: %r" % asked
+    finally:
+        svc.stop()
+        if svc._task is not None:
+            await asyncio.gather(svc._task, return_exceptions=True)
+
+
+async def test_a_run_is_in_flight_from_the_moment_it_is_started():
+    """`busy` is the one answer, and it is true before the task's first step.
+
+    Known-bad: `busy` reading the lock alone. A Clear pressed in that instant
+    was accepted and wiped the transcript the run was about to write into.
+    """
+    brain = HangingBrain()
+    svc = ChatService(FakeLink(), brain)
+    assert svc.start("a long one") is True
+    try:
+        assert svc.busy, "a run just started is not in flight yet"
+        assert svc.reset() is False, "a reset landed before the run's first step"
+        assert svc.start("a second one") is False
+    finally:
+        svc.stop()
+        await asyncio.gather(svc._task, return_exceptions=True)
+    assert not svc.busy, "a run that was stopped still reads as in flight"
+
+
+def _page_send_harness(script: str) -> dict:
+    """The page's REAL `send` and `queueBehind`, run in node against a door
+    that answers what the test says. Everything else is a recorder."""
+    from _page import slice_of
+
+    node = shutil.which("node")
+    if not node:  # pragma: no cover - every runner here has one
+        pytest.skip("needs node to EXECUTE the page")
+    js = "\n".join([
+        "let turnsEnded = 0, busyNow = false, queued = null, vanished = false;",
+        "const said = [], posted = [];",
+        "const i = {value: '', dispatchEvent(){}};",
+        "globalThis.Event = function(){};",
+        "function setQueued(t){ queued = t || null; }",
+        "function orphan(kind, text){ said.push([kind, text]); }",
+        "let answers = [];",
+        "async function door(path, init){ posted.push(JSON.parse(init.body).text);",
+        "  const a = answers.shift(); if(a.before) a.before();",
+        "  return {status: a.status, ok: a.status < 300}; }",
+        slice_of("async function send(text){", "\n}\n"),
+        slice_of("function queueBehind(text, ended){", "\n}\n"),
+        script,
+    ])
+    done = subprocess.run([node, "-e", js], capture_output=True, text=True,
+                          encoding="utf-8", timeout=30)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def test_a_send_refused_for_being_busy_is_queued_not_reported_as_lost():
+    """Known-bad: the page treating 409 like any other failure. It then said
+    the sentence "did not reach the server" and told the person to try again,
+    which the server refuses the same way until the run ends."""
+    got = _page_send_harness(
+        "answers = [{status: 409}];"
+        "send('sort them by price').then(() => process.stdout.write("
+        "JSON.stringify({queued, said, posted, box: i.value})));")
+    assert got["queued"] == "sort them by price"
+    assert got["box"] == "", "the sentence went back in the box as if it were lost"
+    assert [k for k, _ in got["said"]] == ["said"], got["said"]
+    assert "did not reach" not in got["said"][0][1]
+    assert got["posted"] == ["sort them by price"]
+
+
+def test_a_refusal_whose_run_already_ended_here_is_sent_again_not_stranded():
+    """The run's `busy 0` travels on the stream and can beat the 409 to the
+    page. Then nothing is left to flush the queue, so the sentence is sent.
+
+    Known-bad: always queueing. The sentence then sat in the chip of an idle
+    conversation, waiting for the end of a turn that had already been seen."""
+    got = _page_send_harness(
+        "answers = [{status: 409, before(){ turnsEnded++; }}, {status: 200}];"
+        "send('sort them by price').then(() => new Promise(r => setTimeout(r, 0)))"
+        ".then(() => process.stdout.write("
+        "JSON.stringify({queued, said, posted}))); ")
+    assert got["posted"] == ["sort them by price", "sort them by price"]
+    assert got["queued"] is None
+    assert got["said"] == []
+
+
 async def test_stop_with_nothing_running_is_false_rather_than_an_error():
     svc = ChatService(FakeLink(), SilentBrain())
     assert svc.stop() is False

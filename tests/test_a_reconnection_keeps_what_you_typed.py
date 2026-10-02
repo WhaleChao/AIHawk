@@ -70,6 +70,7 @@ def test_a_reconnection_wipes_the_view_and_keeps_the_queue():
         "  globalThis[name] = () => {};",
         "globalThis.$ = () => ({textContent:'', hidden:false, set textContent(v){}});",
         "globalThis.busyNow = false; globalThis.live = null; globalThis.timer = 0;",
+        "globalThis.turnsEnded = 0;",
         "globalThis.queued = null; globalThis.el = () => ({});",
         "WIPE",
         "HERE",
