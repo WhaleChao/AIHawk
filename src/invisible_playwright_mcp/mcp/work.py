@@ -31,6 +31,8 @@ browser and installs it in the server's place.
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from invisible_playwright.async_api import TargetClosedError
@@ -89,6 +91,93 @@ REMEMBERED = "the person this session already was"
 #: round trip. Past this, the answer is "its download is starting" and the
 #: caller asks again; nothing here waits for a transfer.
 ENGINE_SETTLE_SECONDS = 10.0
+
+
+def profile_holder(directory) -> Optional[str]:
+    """Which other Firefox holds a profile directory right now, or None.
+
+    ⛔ READ FROM THE LOCK FIREFOX ACTUALLY TAKES, AND THE TWO SYSTEMS TAKE
+    DIFFERENT ONES. The first version looked for `lock` or `.parentlock` and
+    was wrong on both: on Windows the file is `parent.lock`, so a held profile
+    was never seen, and on Linux `.parentlock` stays behind in every profile a
+    Firefox ever closed, so a closed one read as locked.
+
+    Windows: Firefox keeps `parent.lock` open with no sharing for as long as it
+    runs, and the file stays after it exits. So the question is whether the
+    file can be opened: measured on firefox-34, PermissionError (13) while a
+    browser had the profile, opened after it closed.
+
+    Linux: the lock is the symlink `lock`, pointing at `address:+pid`, which
+    Firefox removes when it exits; one left by a crash names a process that is
+    gone, and Firefox clears that itself, so it does not hold anything.
+
+    Anywhere else this answers None, and a launch that then fails says what the
+    engine said.
+    """
+    if not directory:
+        return None
+    folder = Path(directory)
+    if os.name == "nt":
+        try:
+            with open(folder / "parent.lock", "rb"):
+                return None
+        except PermissionError:
+            return "another Firefox"
+        except OSError:
+            return None
+    try:
+        target = os.readlink(folder / "lock")
+    except OSError:
+        return None
+    host, _, pid = target.rpartition(":+")
+    if not pid.isdigit():
+        return "another Firefox (%s)" % target
+    if host and not _this_machine(host):
+        # Its process cannot be asked from here, so it is taken at its word,
+        # which is what Firefox does with it too.
+        return "a Firefox on %s" % host
+    if not _alive(int(pid)):
+        return None
+    return "another Firefox (process %s)" % pid
+
+
+def _this_machine(address: str) -> bool:
+    """Whether a lock's address names this machine, the way Firefox wrote it."""
+    import socket
+
+    if address.startswith("127."):
+        return True
+    with swallow("a host with no resolvable name is not this machine's address"):
+        return address == socket.gethostbyname(socket.gethostname())
+    return False
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _why_it_did_not_start(settings: dict) -> str:
+    """The cause to look at first, named from what this launch was handed.
+
+    ⛔ IT USED TO SAY "A PROXY THAT IS DOWN IS THE USUAL CAUSE" WHATEVER THE
+    LAUNCH WAS. On 2026-10-01 a helper with no proxy at all failed on a profile
+    another Firefox held, and was told to pass proxy="" - advice about something
+    it did not have, and a value some clients cannot even send. A held profile
+    is refused before the launch now (`Work.open`), so what is left to name
+    here is the exit, when there is one.
+    """
+    if settings.get("proxy"):
+        return (" It was going out through %s; a proxy that is down is a common "
+                "cause, so try another exit." % settings["proxy"]["server"])
+    return ""
 
 
 class Work:
@@ -222,7 +311,8 @@ class Work:
             seed_from, exit_note, warnings = REMEMBERED, "", ()
         else:
             try:
-                chosen = plan.plan_session(seed=seed, proxy=proxy, profile=profile)
+                chosen = plan.plan_session(seed=seed, proxy=proxy, profile=profile,
+                                           helper=role == SUPPORT_BROWSER_ID)
             except (identity.IdentityConflict, ValueError) as exc:
                 # Refused, not guessed. Every case here is one where continuing
                 # would hand the caller a different person than the one they
@@ -249,6 +339,8 @@ class Work:
             if main_launched.get("proxy"):
                 settings["proxy"] = main_launched["proxy"]
             exit_note = "this machine's own address, the same as main"
+
+        self._refuse_a_held_profile(role, settings.get("profile_dir"))
 
         if self._engine is not None and not self._engine.ready():
             # ⛔ AFTER THE PLAN, AND NOT A LAUNCH: AN ANSWER. A plan that is
@@ -288,10 +380,8 @@ class Work:
                 raise RuntimeError(
                     "the %s browser did NOT start: %s\n"
                     "Nothing is browsing there, and the tools will keep failing "
-                    "until browser_open succeeds. A proxy that is down is the "
-                    "usual cause; try another exit, or pass proxy=\"\" to go out "
-                    "from this machine knowing that is what you are doing."
-                    % (role, exc))
+                    "until browser_open succeeds.%s"
+                    % (role, exc, _why_it_did_not_start(settings)))
             self._open[role] = session
             self._launched[role] = settings
             # Opening a browser is working in it: a helper opened mid-task is
@@ -302,6 +392,38 @@ class Work:
                 self.remember()
         return "the %s browser is open. %s" % (role, plan.describe(
             settings, seed_from=seed_from, exit_note=exit_note, warnings=warnings))
+
+    def _refuse_a_held_profile(self, role: str, directory) -> None:
+        """Refuse, BEFORE the launch, a profile another browser holds.
+
+        ⛔ BEFORE, NOT DIAGNOSED AFTER. Firefox lets one process use a profile,
+        and a second one on the same directory does not fail: measured on
+        firefox-34, it did not answer in sixty seconds, and what reached the
+        caller of a failed one was the engine's "the pipe is closed". Before
+        the old browser of this role is closed, too, so a refusal costs
+        nobody the browser they had.
+
+        This role's own browser is the one case that is not a conflict: it is
+        closed first, and reopening `main` on its own profile is ordinary.
+        The other role is known from this process's own record, which holds
+        on every system; anything else is asked of the lock (`profile_holder`).
+        """
+        if not directory:
+            return
+        def holds(r):
+            return r in self._open and (self._launched.get(r) or {}).get("profile_dir") == directory
+        if holds(role):
+            return
+        other = SUPPORT_BROWSER_ID if role == DEFAULT_BROWSER_ID else DEFAULT_BROWSER_ID
+        holder = ("`%s`" % other) if holds(other) else profile_holder(directory)
+        if not holder:
+            return
+        advice = ("Leave profile out for a helper that is not saved, or give it "
+                  "another directory." if role == SUPPORT_BROWSER_ID else
+                  "Close that browser first, or give main another directory.")
+        raise ValueError(
+            "refused: %s already has the profile %s open, and Firefox lets one "
+            "browser use a profile at a time. %s" % (holder, directory, advice))
 
     async def close(self, role: str) -> str:
         """Close one browser. Who it was is kept: `browser_open` with no
