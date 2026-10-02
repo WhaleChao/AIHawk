@@ -158,7 +158,7 @@ SNAPSHOT_JS = """() => {
     // the page, which is a detection surface in a product that exists not to
     // have one. If a stable index is ever wanted, it gets decided in the open.
     const SEL = """ + json.dumps(clean.SNAPSHOT_CSS) + """;
-""" + clean.LABELLED_CONTROL_JS + """
+""" + clean.LABELLED_CONTROL_JS + clean.SECRET_FIELD_JS + """
 
     // offsetParent used to stand in for "visible" and was wrong both ways: it is
     // null on every position:fixed element - the cookie banner, the sticky bar,
@@ -326,7 +326,13 @@ SNAPSHOT_JS = """() => {
         const r = el.getBoundingClientRect();
         const isSel = el.tagName === 'SELECT';
         const isBox = el.type === 'checkbox' || el.type === 'radio';
-        const text = (isSel ? chosen(el) : (el.innerText || el.value || '')).trim().replace(/\\s+/g, ' ').slice(0, 60);
+        // A secret field reports THAT it is filled, never what with: the
+        // snapshot is returned to the model, so its value would be printed
+        // into the conversation the moment anything typed a password. Which
+        // fields are secret is decided once, in clean.SECRET_FIELD_JS.
+        const secret = secretField(el);
+        const value = secret ? (el.value ? """ + json.dumps(clean.MASKED_PASSWORD) + """ : '') : el.value;
+        const text = (isSel ? chosen(el) : (el.innerText || value || '')).trim().replace(/\\s+/g, ' ').slice(0, 60);
         const href = el.tagName === 'A' ? useful(el.getAttribute('href')) : undefined;
 
         const e = { tag: el.tagName.toLowerCase() };
