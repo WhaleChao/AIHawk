@@ -118,13 +118,37 @@ async def give_history(dot_id: str, question: dict[str, Any], history: str) -> N
         raise RuntimeError(f"writing the history failed: {result['stderr'][-1500:]}")
 
 
-async def answer(question: dict[str, Any], history: str, out: Path) -> dict[str, Any]:
+# Run by the engine's own Python in the Dot: the prompt the Dot's memory pass works from (templates/agent/dream.md),
+# over every conversation file.
+DREAM_PROMPT = """
+import pathlib
+from nanobot.dots.conversations import CONVERSATIONS_DIR
+from nanobot.dots.skills import DOT_SKILLS_DIR
+from nanobot.dots.turns import MEMORY_DIR
+from nanobot.utils.prompt_templates import render_template
+files = sorted(str(path) for path in pathlib.Path(CONVERSATIONS_DIR).rglob("*.md"))
+print(render_template("agent/dream.md", conversations=files, memory_dir=MEMORY_DIR, dot_skills_dir=DOT_SKILLS_DIR))
+"""
+
+
+async def dream(dot_id: str) -> dict[str, Any]:
+    """The memory pass over the history, as a task before the question."""
+    rendered = await bridge.call(
+        "exec", dot_id, "120000", stdin=f"/opt/invisible-dots-engine/bin/python -I -B - <<'PY'\n{DREAM_PROMPT}\nPY\n".encode()
+    )
+    if rendered["exit_code"] != 0:
+        raise RuntimeError(f"rendering the memory pass failed: {rendered['stderr'][-1500:]}")
+    return await bridge.call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=rendered["stdout"].encode())
+
+
+async def answer(question: dict[str, Any], history: str, out: Path, with_dream: bool) -> dict[str, Any]:
     name = f"bench-lme-{hashlib.sha256(question['question_id'].encode()).hexdigest()[:10]}"
     started = time.monotonic()
     created = await bridge.call("create", name, stdin=dot_yaml(name, cpus=2, memory_gb=4).encode())
     dot_id = created["id"]
     try:
         await give_history(dot_id, question, history)
+        dreamt = await dream(dot_id) if with_dream else {}
         task = await bridge.call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=task_text(question).encode())
         events = await bridge.call("events", dot_id, task["id"])
         (out / "events").mkdir(exist_ok=True)
@@ -136,6 +160,11 @@ async def answer(question: dict[str, Any], history: str, out: Path) -> dict[str,
         )
         (out / "engine").mkdir(exist_ok=True)
         (out / "engine" / f"{question['question_id']}.log").write_text(journal["stdout"] or journal["stderr"], encoding="utf-8")
+        if with_dream:
+            # What the memory pass left the question to work from.
+            memory = await bridge.call("exec", dot_id, "60000", stdin=b"cat /home/dot/memory/MEMORY.md")
+            (out / "memory").mkdir(exist_ok=True)
+            (out / "memory" / f"{question['question_id']}.md").write_text(memory["stdout"], encoding="utf-8")
     finally:
         await bridge.call("delete", dot_id)
     return {
@@ -145,6 +174,7 @@ async def answer(question: dict[str, Any], history: str, out: Path) -> dict[str,
         "error": task.get("error"),
         "spent_usd": task.get("spent_usd"),
         "seconds": round(time.monotonic() - started),
+        **({"dream_status": dreamt.get("status"), "dream_spent_usd": dreamt.get("spent_usd")} if with_dream else {}),
     }
 
 
@@ -164,7 +194,7 @@ async def run(args: argparse.Namespace) -> None:
     async def one(question: dict[str, Any]) -> None:
         async with gate:
             try:
-                row = await answer(question, args.history, out)
+                row = await answer(question, args.history, out, args.dream)
             except Exception as error:  # a question the product could not run is reported, not graded
                 print(f"{question['question_id']}: {error}", file=sys.stderr, flush=True)
                 return
@@ -247,6 +277,9 @@ def main() -> None:
         sub.add_argument("--data", required=True)
         sub.add_argument("--out", required=True)
     commands.choices["run"].add_argument("--history", default="conversations", choices=["conversations", "none"])
+    commands.choices["run"].add_argument(
+        "--dream", action="store_true", help="the memory pass (templates/agent/dream.md) runs as a task before the question"
+    )
     commands.choices["run"].add_argument("--questions", type=int, default=116)
     commands.choices["run"].add_argument("--kind", help="every question of this question_type instead of the subset")
     commands.choices["run"].add_argument("-n", type=int, default=4)

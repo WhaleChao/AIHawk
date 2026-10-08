@@ -39,7 +39,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.transcript_metadata import METADATA_KEY
 from nanobot.dots import conversations
 from nanobot.dots import store as dots_store
-from nanobot.dots.computer import Computer, ComputerError, Entry
+from nanobot.dots.computer import Computer, ComputerError, Entry, FileTooLargeError
 from nanobot.dots.gate import close_open_calls
 from nanobot.dots.images import TurnImages, bind_turn_images, reset_turn_images
 from nanobot.dots.permissions import tool_starts_terminal, tool_target
@@ -58,6 +58,11 @@ from nanobot.utils.llm_runtime import LLMRuntime
 MEMORY_DIR = "/home/dot/memory"
 # How many of the most recently changed memory notes the prompt names.
 MEMORY_NOTES_LISTED = 20
+# The note the prompt carries whole: what the Dot always knows, and what its other notes hold.
+MEMORY_INDEX = "MEMORY.md"
+# The most of it the prompt carries, as Claude Code does with its own MEMORY.md (25KB); the rest is cut, and
+# the Dot is told to make it shorter.
+MEMORY_INDEX_MAX_CHARS = 25_000
 
 
 class TurnAbandoned(Exception):
@@ -309,6 +314,7 @@ class TurnRunner:
             workspace=settings.workspace,
             memory_dir=MEMORY_DIR,
             memory_notes=await self._recent_notes(),
+            memory_index=await self._memory_index(),
             now=datetime.now().astimezone(),
             skills=await all_skills(self._computer),
         )
@@ -438,6 +444,21 @@ class TurnRunner:
             logger.warning("could not write the conversation files: {}", exc)
             return
         self._store.write(lambda conn: dots_store.write_kv(conn, conversations.KV_CHAT_WRITTEN, chat_length))
+
+    async def _memory_index(self) -> str:
+        """The text of the Dot's MEMORY.md, cut at MEMORY_INDEX_MAX_CHARS; empty when it has none."""
+        try:
+            data = await self._computer.read_bytes(f"{MEMORY_DIR}/{MEMORY_INDEX}")
+        except (ComputerError, FileTooLargeError) as exc:
+            logger.warning("could not read {}: {}", MEMORY_INDEX, exc)
+            return ""
+        text = (data or b"").decode("utf-8", errors="replace").strip()
+        if len(text) > MEMORY_INDEX_MAX_CHARS:
+            return (
+                f"{text[:MEMORY_INDEX_MAX_CHARS]}\n\n(MEMORY.md is cut here, at {MEMORY_INDEX_MAX_CHARS} characters: "
+                "make it shorter, moving details into other notes.)"
+            )
+        return text
 
     async def _recent_notes(self) -> list[str]:
         """Names of the most recently changed memory notes, newest first."""

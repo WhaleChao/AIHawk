@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -15,7 +16,7 @@ from nanobot.dots import conversations
 from nanobot.dots import store as s
 from nanobot.dots.permissions import tool_target
 from nanobot.dots.transcript_outbox import APPROVAL_ID, INBOUND_ID
-from nanobot.dots.turns import OpeningMessage, TurnUnit
+from nanobot.dots.turns import MEMORY_INDEX_MAX_CHARS, OpeningMessage, TurnUnit
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META
 from nanobot.session.summary import SUMMARY_CONTINUATION_TEXT
 
@@ -198,3 +199,33 @@ class TestATurnWritesThem:
 
         system = h.provider.requests[0]["messages"][0]["content"]
         assert f"kept in {conversations.CONVERSATIONS_DIR}" in system
+
+
+class TestMemoryMd:
+    async def test_the_prompt_carries_it(self, make_harness: MakeHarness) -> None:
+        h = make_harness([says("hi")])
+        note = h.computer._local("/home/dot/memory/MEMORY.md")
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("- has a cat named Luna (2023-05-20)\n", encoding="utf-8")
+        h.accept("in1", "hello")
+
+        await h.run(chat_unit("hello", "in1"))
+
+        assert "### MEMORY.md\n- has a cat named Luna (2023-05-20)" in h.provider.requests[0]["messages"][0]["content"]
+
+    async def test_one_too_long_is_cut_and_the_dot_is_told_to_shorten_it(self, make_harness: MakeHarness) -> None:
+        h = make_harness([says("hi")])
+        # Room for it: the cut is under test, not the window.
+        h.provider.default_limits = replace(h.provider.default_limits, context_tokens=200_000)
+        note = h.computer._local("/home/dot/memory/MEMORY.md")
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("x" * (MEMORY_INDEX_MAX_CHARS + 500), encoding="utf-8")
+        h.accept("in1", "hello")
+
+        outcome = await h.run(chat_unit("hello", "in1"))
+
+        assert outcome.kind == "completed", outcome
+
+        system = h.provider.requests[0]["messages"][0]["content"]
+        assert "x" * MEMORY_INDEX_MAX_CHARS + "\n\n(MEMORY.md is cut here" in system
+        assert "x" * (MEMORY_INDEX_MAX_CHARS + 1) not in system

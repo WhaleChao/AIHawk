@@ -54,7 +54,8 @@ def test_nothing_of_the_upstream_assistants_identity_or_platform_is_left() -> No
 def test_the_memory_section_says_the_dot_keeps_its_notes_itself_with_the_file_tools() -> None:
     prompt = builder().build_system_prompt()
 
-    assert "Your long-term memory is /home/dot/memory, one note per file, and you keep it yourself" in prompt
+    assert "Your long-term memory is /home/dot/memory, and you keep it yourself" in prompt
+    assert "`MEMORY.md` there is given to you in every conversation and task" in prompt
     for tool in ("grep", "find_files", "read_file", "write_file", "edit_file"):
         assert tool in prompt
     assert "Most recently changed notes" not in prompt
@@ -112,3 +113,18 @@ def test_with_no_current_message_the_transcript_ends_with_the_history() -> None:
     messages = builder().build_transcript(TranscriptInput(history=history, current_message=None))
 
     assert messages[1:] == history
+
+
+def test_memory_md_is_carried_whole_under_the_memory_section() -> None:
+    prompt = ContextBuilder(
+        DOT,
+        workspace="/home/dot/workspace",
+        memory_dir="/home/dot/memory",
+        memory_notes=(),
+        now=NOW,
+        memory_index="- has a cat named Luna (2023-05-20)",
+    ).build_system_prompt()
+
+    memory = prompt[prompt.index("## Memory") : prompt.index("## Past conversations")]
+    assert "### MEMORY.md\n- has a cat named Luna (2023-05-20)" in memory
+    assert "### MEMORY.md" not in builder().build_system_prompt()
