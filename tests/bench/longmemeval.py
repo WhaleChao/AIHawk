@@ -158,34 +158,63 @@ print(render_template(
 """
 
 
-async def profile(dot_id: str) -> dict[str, Any]:
-    """MEMORY.md written by one request from the conversations, as the engine would send it, then put in the Dot."""
+# Run by the engine's own Python in the Dot: the conversation files, oldest first, as JSON.
+CONVERSATIONS_JSON = """
+import json, pathlib
+from nanobot.dots.conversations import CONVERSATIONS_DIR
+files = sorted(pathlib.Path(CONVERSATIONS_DIR).rglob("*.md"))
+print(json.dumps([{"path": str(f), "text": f.read_text(encoding="utf-8")} for f in files]))
+"""
+
+
+async def _engine_python(dot_id: str, script: str, what: str) -> str:
+    result = await bridge.call(
+        "exec", dot_id, "120000", stdin=f"/opt/invisible-dots-engine/bin/python -I -B - <<'PY'\n{script}\nPY\n".encode()
+    )
+    if result["exit_code"] != 0:
+        raise RuntimeError(f"{what} failed: {result['stderr'][-1500:]}")
+    return result["stdout"]
+
+
+async def profile(dot_id: str, variant: str) -> dict[str, Any]:
+    """MEMORY.md written from the conversations, outside the Dot with the Dot's model, then put in the Dot: by our one
+    request (templates/agent/memory_update.md, "ours") or by an open-source method ported in memory_variants.py."""
     from openai import AsyncOpenAI
 
-    rendered = await bridge.call(
-        "exec", dot_id, "120000", stdin=f"/opt/invisible-dots-engine/bin/python -I -B - <<'PY'\n{PROFILE_PROMPT}\nPY\n".encode()
-    )
-    if rendered["exit_code"] != 0:
-        raise RuntimeError(f"rendering the memory update failed: {rendered['stderr'][-1500:]}")
     key = Path(os.environ["E2E_OPENROUTER_KEY_FILE"]).read_text(encoding="utf-8").strip()
     client = AsyncOpenAI(api_key=key, base_url="https://openrouter.ai/api/v1")
-    completion = await client.chat.completions.create(
-        model=os.environ.get("BENCH_MODEL", "z-ai/glm-5.3-flash"),
-        messages=[{"role": "user", "content": rendered["stdout"]}],
-        extra_body={"usage": {"include": True}},
-    )
-    text = (completion.choices[0].message.content or "").strip()
+    finishes: list[str | None] = []
+
+    async def complete(messages: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        completion = await client.chat.completions.create(
+            model=os.environ.get("BENCH_MODEL", "z-ai/glm-5.3-flash"),
+            messages=messages,
+            extra_body={"usage": {"include": True}},
+        )
+        finishes.append(completion.choices[0].finish_reason)
+        return (completion.choices[0].message.content or "").strip(), (completion.usage.model_dump() if completion.usage else {})
+
+    if variant == "ours":
+        prompt = await _engine_python(dot_id, PROFILE_PROMPT, "rendering the memory update")
+        text, usage = await complete([{"role": "user", "content": prompt}])
+        usages = [usage]
+    else:
+        import memory_variants
+
+        conversations = json.loads(await _engine_python(dot_id, CONVERSATIONS_JSON, "reading the conversations"))
+        text, usages = await memory_variants.write_memory(variant, conversations, "", complete)
     await bridge.call("put", dot_id, "/home/dot/memory/MEMORY.md", stdin=(text + "\n").encode())
-    usage = completion.usage.model_dump() if completion.usage else {}
     return {
-        "profile_spent_usd": usage.get("cost"),
-        "profile_prompt_tokens": usage.get("prompt_tokens"),
-        "profile_answer_tokens": usage.get("completion_tokens"),
-        "profile_finish": completion.choices[0].finish_reason,
+        "profile_variant": variant,
+        "profile_calls": len(usages),
+        "profile_spent_usd": sum(u.get("cost") or 0 for u in usages),
+        "profile_prompt_tokens": sum(u.get("prompt_tokens") or 0 for u in usages),
+        "profile_answer_tokens": sum(u.get("completion_tokens") or 0 for u in usages),
+        "profile_finish": sorted({str(f) for f in finishes}),
     }
 
 
-async def answer(question: dict[str, Any], history: str, out: Path, with_dream: bool, with_profile: bool) -> dict[str, Any]:
+async def answer(question: dict[str, Any], history: str, out: Path, with_dream: bool, profile_variant: str | None) -> dict[str, Any]:
     name = f"bench-lme-{hashlib.sha256(question['question_id'].encode()).hexdigest()[:10]}"
     started = time.monotonic()
     created = await bridge.call("create", name, stdin=dot_yaml(name, cpus=2, memory_gb=4).encode())
@@ -193,7 +222,7 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
     try:
         await give_history(dot_id, question, history)
         dreamt = await dream(dot_id) if with_dream else {}
-        profiled = await profile(dot_id) if with_profile else {}
+        profiled = await profile(dot_id, profile_variant) if profile_variant else {}
         if with_dream:
             (out / "dream-events").mkdir(exist_ok=True)
             (out / "dream-events" / f"{question['question_id']}.json").write_text(
@@ -210,7 +239,7 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
         )
         (out / "engine").mkdir(exist_ok=True)
         (out / "engine" / f"{question['question_id']}.log").write_text(journal["stdout"] or journal["stderr"], encoding="utf-8")
-        if with_dream or with_profile:
+        if with_dream or profile_variant:
             # What the memory pass left the question to work from.
             memory = await bridge.call("exec", dot_id, "60000", stdin=b"cat /home/dot/memory/MEMORY.md")
             (out / "memory").mkdir(exist_ok=True)
@@ -337,8 +366,9 @@ def main() -> None:
     )
     commands.choices["run"].add_argument(
         "--profile",
-        action="store_true",
-        help="MEMORY.md is written by one request (templates/agent/memory_update.md) before the question",
+        choices=["ours", "mastra", "langmem", "memobase"],
+        help="MEMORY.md is written before the question: by our one request (templates/agent/memory_update.md) "
+        "or by an open-source method (memory_variants.py)",
     )
     commands.choices["run"].add_argument("--questions", type=int, default=116)
     commands.choices["run"].add_argument("--kind", help="every question of this question_type instead of the subset")
