@@ -1,4 +1,4 @@
-"""A prompt's tokens as the provider will count them: its own count of what it took, and a scaled estimate of the rest."""
+"""A prompt's tokens as the endpoint will count them: the estimate scaled by the largest ratio measured or shown."""
 
 from __future__ import annotations
 
@@ -25,53 +25,29 @@ def scaled(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = 
 
 
 class TestPromptCounts:
-    def test_a_prompt_nothing_was_counted_of_is_its_estimate_scaled_up(self) -> None:
+    def test_a_prompt_is_its_estimate_scaled_by_the_largest_ratio_measured(self) -> None:
         messages = [SYSTEM, user("hello")]
 
-        assert PromptCounts().estimate(MODEL, messages, TOOLS) == (scaled(messages, TOOLS), "scaled estimate")
+        assert PromptCounts().estimate(MODEL, messages, TOOLS) == (scaled(messages, TOOLS), "estimate scaled by 1.35")
 
-    def test_a_prompt_that_extends_a_counted_one_is_its_count_plus_what_was_added_scaled(self) -> None:
+    def test_a_model_that_counts_less_keeps_the_measured_ratio(self) -> None:
+        # OpenRouter refuses by a count of its own, above the model's: a model's low count does not lower it.
         counts = PromptCounts()
-        first = [SYSTEM, user("hello")]
-        counts.observe(MODEL, first, TOOLS, 3_000)
-        added = [{"role": "assistant", "content": "hi"}, user("a file\n" * 5_000)]
+        first = [SYSTEM, user("x " * 3_000)]
+        counts.observe(MODEL, first, None, estimate_prompt_tokens(first, None))
 
-        tokens, source = counts.estimate(MODEL, [*first, *added], TOOLS)
-
-        assert (tokens, source) == (3_000 + scaled(added), "provider count plus scaled estimate")
-
-    def test_other_tools_or_another_model_are_another_prompt(self) -> None:
-        counts = PromptCounts()
-        first = [SYSTEM, user("hello")]
-        counts.observe(MODEL, first, TOOLS, 3_000)
-        longer = [*first, user("more")]
-
-        assert counts.estimate(MODEL, longer, None)[1] == "scaled estimate"
-        assert counts.estimate("anthropic/claude-sonnet-4.5", longer, TOOLS)[1] == "scaled estimate"
-
-    def test_the_longest_counted_prefix_is_used_when_the_chat_and_a_task_alternate(self) -> None:
-        counts = PromptCounts()
-        chat = [SYSTEM, user("chat")]
-        task = [SYSTEM, user("task")]
-        counts.observe(MODEL, chat, TOOLS, 1_000)
-        counts.observe(MODEL, [*chat, user("more chat")], TOOLS, 1_500)
-        counts.observe(MODEL, task, TOOLS, 2_000)
-        added = user("still the chat")
-
-        tokens, _ = counts.estimate(MODEL, [*chat, user("more chat"), added], TOOLS)
-
-        assert tokens == 1_500 + scaled([added])
+        assert counts.estimate(MODEL, [user("other")], None)[0] == scaled([user("other")])
 
     def test_a_model_that_counts_more_than_the_ratio_scales_by_its_own(self) -> None:
         counts = PromptCounts()
         first = [SYSTEM, user("x " * 3_000)]
-        estimated = estimate_prompt_tokens(first, None)
-        counts.observe(MODEL, first, None, 2 * estimated)
+        counts.observe(MODEL, first, None, 2 * estimate_prompt_tokens(first, None))
 
         assert counts.estimate(MODEL, [user("other")], None)[0] == scaled([user("other")], ratio=2.0)
+        assert counts.estimate("openai/gpt-4o-mini", [user("other")], None)[0] == scaled([user("other")])
 
     def test_a_small_prompt_teaches_no_ratio(self) -> None:
-        # Around each message the provider adds tokens the estimate does not see: on a few tokens they would look
+        # Around each message the endpoint adds tokens the estimate does not see: on a few tokens they would look
         # like a tokenizer that counts far more.
         counts = PromptCounts()
         counts.observe(MODEL, [user("hi")], None, 40)
@@ -80,19 +56,21 @@ class TestPromptCounts:
 
 
 class TestTheProvider:
-    async def test_what_the_endpoint_counted_sizes_the_next_request(self) -> None:
-        first = [SYSTEM, user("hello")]
+    async def test_what_the_endpoint_counted_teaches_the_provider_the_models_ratio(self) -> None:
+        first = [SYSTEM, user("x " * 3_000)]
+        counted = 2 * estimate_prompt_tokens(first, TOOLS)
         stream = FakeStream([
             as_sdk_object(chunk({"role": "assistant", "content": "hi"}, finish="stop")),
-            as_sdk_object(chunk(usage={"prompt_tokens": 4_321, "completion_tokens": 1, "total_tokens": 4_322})),
+            as_sdk_object(chunk(usage={"prompt_tokens": counted, "completion_tokens": 1, "total_tokens": counted + 1})),
         ])
         provider, _ = provider_streaming(stream)
         await provider.chat_stream(first, tools=TOOLS, model=MODEL)
-        added = [{"role": "assistant", "content": "hi"}, user("next")]
+        later = [*first, {"role": "assistant", "content": "hi"}, user("next")]
 
-        tokens, source = estimate_prompt_tokens_chain(provider, MODEL, [*first, *added], TOOLS)
+        tokens, source = estimate_prompt_tokens_chain(provider, MODEL, later, TOOLS)
 
-        assert (tokens, source) == (4_321 + scaled(added), "provider count plus scaled estimate")
+        assert tokens == scaled(later, TOOLS, ratio=2.0)
+        assert source == "estimate scaled by 2.00"
 
     def test_an_answer_limit_from_it_fits_the_window_of_a_model_that_counts_a_third_more(self) -> None:
         # Claude counts Python a third above tiktoken (prompt_count.py): a limit from the plain estimate overflowed.
@@ -105,3 +83,11 @@ class TestTheProvider:
         limit = answer_limit(window, window, tokens)
 
         assert limit is not None and counted + limit <= window
+
+    def test_the_glm_refusal_measured_on_a_dot_does_not_happen_again(self) -> None:
+        # 2026-10-08, a Dot's memory pass: the engine took the prompt for 103346 tokens, OpenRouter counted 105796
+        # and refused the model's longest answer (943717) on a window of 1048576.
+        window, longest, openrouter_counted, plain_estimate = 1_048_576, 943_717, 105_796, 103_346
+        limit = answer_limit(window, longest, math.ceil(plain_estimate * UNCOUNTED_RATIO))
+
+        assert limit is not None and openrouter_counted + limit <= window

@@ -149,6 +149,11 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
     try:
         await give_history(dot_id, question, history)
         dreamt = await dream(dot_id) if with_dream else {}
+        if with_dream:
+            (out / "dream-events").mkdir(exist_ok=True)
+            (out / "dream-events" / f"{question['question_id']}.json").write_text(
+                json.dumps(await bridge.call("events", dot_id, dreamt["id"]), indent=1), encoding="utf-8"
+            )
         task = await bridge.call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=task_text(question).encode())
         events = await bridge.call("events", dot_id, task["id"])
         (out / "events").mkdir(exist_ok=True)
@@ -174,7 +179,11 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
         "error": task.get("error"),
         "spent_usd": task.get("spent_usd"),
         "seconds": round(time.monotonic() - started),
-        **({"dream_status": dreamt.get("status"), "dream_spent_usd": dreamt.get("spent_usd")} if with_dream else {}),
+        **(
+            {"dream_status": dreamt.get("status"), "dream_error": dreamt.get("error"), "dream_spent_usd": dreamt.get("spent_usd")}
+            if with_dream
+            else {}
+        ),
     }
 
 
