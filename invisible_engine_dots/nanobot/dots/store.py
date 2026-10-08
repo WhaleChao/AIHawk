@@ -535,6 +535,12 @@ def get_task_by_session(conn: sqlite3.Connection, session_key: str) -> TaskRow |
     )
 
 
+def list_tasks(conn: sqlite3.Connection) -> list[TaskRow]:
+    """Every task, in the order they arrived."""
+    rows = conn.execute(f"SELECT {_TASK_COLUMNS} FROM dots_tasks ORDER BY created_order").fetchall()
+    return [task for row in rows if (task := _task(row))]
+
+
 def get_running_task(conn: sqlite3.Connection) -> TaskRow | None:
     """The running task, if any (at most one runs)."""
     return _task(
