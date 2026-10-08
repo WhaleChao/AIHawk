@@ -13,7 +13,8 @@ the Dot. TEST HARNESS ONLY.
 
 `run` answers the questions not yet in <dir>/hypotheses.jsonl (a stopped run goes on where it stopped);
 `judge` grades the answers not yet in <dir>/judged.jsonl and writes <dir>/report.md. The questions are a
-fixed subset of 116, proportional to the benchmark's six kinds of question (`--questions 500` for all).
+fixed subset of 116, proportional to the benchmark's six kinds of question (`--questions 500` for all);
+`--kind <question_type>` takes every question of one kind instead.
 
 --history conversations (the default): the sessions become the Dot's chat files, by day, in
 /home/dot/conversations, written by the engine's own code in the Dot (nanobot/dots/conversations.py), as if
@@ -128,6 +129,13 @@ async def answer(question: dict[str, Any], history: str, out: Path) -> dict[str,
         events = await bridge.call("events", dot_id, task["id"])
         (out / "events").mkdir(exist_ok=True)
         (out / "events" / f"{question['question_id']}.json").write_text(json.dumps(events, indent=1), encoding="utf-8")
+        # The engine's own log goes with the Dot: kept for every question, since a wrong answer is known only
+        # once judged.
+        journal = await bridge.call(
+            "exec", dot_id, "60000", stdin=b"journalctl -u invisible-dots-agent --no-pager -o cat | tail -n 3000"
+        )
+        (out / "engine").mkdir(exist_ok=True)
+        (out / "engine" / f"{question['question_id']}.log").write_text(journal["stdout"] or journal["stderr"], encoding="utf-8")
     finally:
         await bridge.call("delete", dot_id)
     return {
@@ -143,7 +151,11 @@ async def answer(question: dict[str, Any], history: str, out: Path) -> dict[str,
 async def run(args: argparse.Namespace) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    questions = subset(json.loads(Path(args.data).read_text(encoding="utf-8")), args.questions)
+    every = json.loads(Path(args.data).read_text(encoding="utf-8"))
+    if args.kind:
+        questions = sorted((q for q in every if q["question_type"] == args.kind), key=lambda q: q["question_id"])
+    else:
+        questions = subset(every, args.questions)
     done = {row["question_id"] for row in read_jsonl(out / "hypotheses.jsonl")}
     todo = [q for q in questions if q["question_id"] not in done]
     print(f"{len(questions)} questions, {len(done)} answered, {len(todo)} to go, {args.n} at once", flush=True)
@@ -236,6 +248,7 @@ def main() -> None:
         sub.add_argument("--out", required=True)
     commands.choices["run"].add_argument("--history", default="conversations", choices=["conversations", "none"])
     commands.choices["run"].add_argument("--questions", type=int, default=116)
+    commands.choices["run"].add_argument("--kind", help="every question of this question_type instead of the subset")
     commands.choices["run"].add_argument("-n", type=int, default=4)
     args = parser.parse_args()
     if args.command == "run":
