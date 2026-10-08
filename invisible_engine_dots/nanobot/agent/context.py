@@ -59,7 +59,9 @@ class ContextBuilder:
                 conversations_dir=CONVERSATIONS_DIR,
                 skills=list(self.skills),
                 dot_skills_dir=DOT_SKILLS_DIR,
-                now=self.now.strftime("%Y-%m-%d %H:%M %Z").strip(),
+                # The day, not the minute: the prompt then stays the same all day, so the provider's cache of it
+                # and its count of the prompt (prompt_count.py) hold from one turn to the next.
+                today=self.now.strftime("%Y-%m-%d (%A) %Z").strip(),
             ),
         ]
         if session_summary and session_summary["text"] != "(nothing)":
