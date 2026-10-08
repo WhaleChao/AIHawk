@@ -141,7 +141,51 @@ async def dream(dot_id: str) -> dict[str, Any]:
     return await bridge.call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=rendered["stdout"].encode())
 
 
-async def answer(question: dict[str, Any], history: str, out: Path, with_dream: bool) -> dict[str, Any]:
+# Run by the engine's own Python in the Dot: the one request that writes MEMORY.md from the conversations
+# (templates/agent/memory_update.md).
+PROFILE_PROMPT = """
+import pathlib
+from nanobot.dots.conversations import CONVERSATIONS_DIR
+from nanobot.dots.turns import MEMORY_DIR, MEMORY_INDEX
+from nanobot.utils.prompt_templates import render_template
+memory = pathlib.Path(MEMORY_DIR, MEMORY_INDEX)
+files = sorted(pathlib.Path(CONVERSATIONS_DIR).rglob("*.md"))
+print(render_template(
+    "agent/memory_update.md",
+    memory_md=memory.read_text(encoding="utf-8") if memory.exists() else "",
+    conversations=[{"path": str(f), "text": f.read_text(encoding="utf-8")} for f in files],
+))
+"""
+
+
+async def profile(dot_id: str) -> dict[str, Any]:
+    """MEMORY.md written by one request from the conversations, as the engine would send it, then put in the Dot."""
+    from openai import AsyncOpenAI
+
+    rendered = await bridge.call(
+        "exec", dot_id, "120000", stdin=f"/opt/invisible-dots-engine/bin/python -I -B - <<'PY'\n{PROFILE_PROMPT}\nPY\n".encode()
+    )
+    if rendered["exit_code"] != 0:
+        raise RuntimeError(f"rendering the memory update failed: {rendered['stderr'][-1500:]}")
+    key = Path(os.environ["E2E_OPENROUTER_KEY_FILE"]).read_text(encoding="utf-8").strip()
+    client = AsyncOpenAI(api_key=key, base_url="https://openrouter.ai/api/v1")
+    completion = await client.chat.completions.create(
+        model=os.environ.get("BENCH_MODEL", "z-ai/glm-5.3-flash"),
+        messages=[{"role": "user", "content": rendered["stdout"]}],
+        extra_body={"usage": {"include": True}},
+    )
+    text = (completion.choices[0].message.content or "").strip()
+    await bridge.call("put", dot_id, "/home/dot/memory/MEMORY.md", stdin=(text + "\n").encode())
+    usage = completion.usage.model_dump() if completion.usage else {}
+    return {
+        "profile_spent_usd": usage.get("cost"),
+        "profile_prompt_tokens": usage.get("prompt_tokens"),
+        "profile_answer_tokens": usage.get("completion_tokens"),
+        "profile_finish": completion.choices[0].finish_reason,
+    }
+
+
+async def answer(question: dict[str, Any], history: str, out: Path, with_dream: bool, with_profile: bool) -> dict[str, Any]:
     name = f"bench-lme-{hashlib.sha256(question['question_id'].encode()).hexdigest()[:10]}"
     started = time.monotonic()
     created = await bridge.call("create", name, stdin=dot_yaml(name, cpus=2, memory_gb=4).encode())
@@ -149,6 +193,7 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
     try:
         await give_history(dot_id, question, history)
         dreamt = await dream(dot_id) if with_dream else {}
+        profiled = await profile(dot_id) if with_profile else {}
         if with_dream:
             (out / "dream-events").mkdir(exist_ok=True)
             (out / "dream-events" / f"{question['question_id']}.json").write_text(
@@ -165,7 +210,7 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
         )
         (out / "engine").mkdir(exist_ok=True)
         (out / "engine" / f"{question['question_id']}.log").write_text(journal["stdout"] or journal["stderr"], encoding="utf-8")
-        if with_dream:
+        if with_dream or with_profile:
             # What the memory pass left the question to work from.
             memory = await bridge.call("exec", dot_id, "60000", stdin=b"cat /home/dot/memory/MEMORY.md")
             (out / "memory").mkdir(exist_ok=True)
@@ -184,6 +229,7 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
             if with_dream
             else {}
         ),
+        **profiled,
     }
 
 
@@ -203,7 +249,7 @@ async def run(args: argparse.Namespace) -> None:
     async def one(question: dict[str, Any]) -> None:
         async with gate:
             try:
-                row = await answer(question, args.history, out, args.dream)
+                row = await answer(question, args.history, out, args.dream, args.profile)
             except Exception as error:  # a question the product could not run is reported, not graded
                 print(f"{question['question_id']}: {error}", file=sys.stderr, flush=True)
                 return
@@ -288,6 +334,11 @@ def main() -> None:
     commands.choices["run"].add_argument("--history", default="conversations", choices=["conversations", "none"])
     commands.choices["run"].add_argument(
         "--dream", action="store_true", help="the memory pass (templates/agent/dream.md) runs as a task before the question"
+    )
+    commands.choices["run"].add_argument(
+        "--profile",
+        action="store_true",
+        help="MEMORY.md is written by one request (templates/agent/memory_update.md) before the question",
     )
     commands.choices["run"].add_argument("--questions", type=int, default=116)
     commands.choices["run"].add_argument("--kind", help="every question of this question_type instead of the subset")
