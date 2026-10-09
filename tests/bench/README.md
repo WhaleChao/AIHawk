@@ -131,7 +131,8 @@ docker exec -w /work/dots -e E2E_OPENROUTER_KEY_FILE=/run/secrets/openrouter ido
 Measured with z-ai/glm-5.3-flash (October 2026), 116 questions: 7.8% with no
 history (the control, `--history none`), 82.8% with the conversation files, 88%
 after the token and prompt fixes that run found, 90.5% with MEMORY.md written
-by the memory pass (updates 78 to 94%, preferences 57 to 71%).
+as the memory pass does it (updates 78 to 94%, preferences 57 to 71%), and
+90.4% (104/115) with the Dots making their own pass, at $0.025 a pass.
 
 How MEMORY.md is written was chosen on the 30 preference questions, the same
 for every method:

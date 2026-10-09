@@ -1,6 +1,6 @@
 ---
 title: "How a Dot remembers"
-description: "Past conversations kept as files the agent greps, a profile of the person in every prompt, and a background pass that keeps it current. Measured on LongMemEval: 7.8% to 90.5%."
+description: "Past conversations kept as files the agent greps, a profile of the person in every prompt, and a background pass that keeps it current. Measured on LongMemEval: 7.8% to 90.4%."
 parent: "Studies"
 nav_order: 1
 ---
@@ -38,10 +38,13 @@ z-ai/glm-5.3-flash. The harness is `tests/bench/longmemeval.py`.
 | No history at all (the control) | 9/116 | 7.8% |
 | Conversations as files | 96/116 | 82.8% |
 | + the fixes that run found | 102/116 | 87.9% |
-| + `MEMORY.md` from the memory pass | 105/116 | **90.5%** |
+| + `MEMORY.md`, written outside the Dot as the pass would | 105/116 | 90.5% |
+| + the memory pass in the product | 104/115 | **90.4%** |
 
 The control only gets the four questions whose answer is "you never told
-me", and five it can guess.
+me", and five it can guess. The last row is the product as shipped: each Dot
+made its own pass five quiet minutes after it started, then answered (one
+question of the 116 did not run).
 
 ## Conversations as files
 
@@ -112,7 +115,8 @@ How this was chosen among five methods is in
 
 ## What it costs
 
-With glm-5.3-flash a pass over a whole 115,000-token history costs about
-$0.015. In use a pass reads only what changed since the last one, so a normal
-day of chat comes to about a cent. Answering a question that needs the
+With glm-5.3-flash a pass over a whole 115,000-token history cost $0.025 on
+average in the product run ($0.015 in the study, where the request was sent
+from outside the Dot). In use a pass reads only what changed since the last
+one, so a normal day of chat should come to a cent or two. Answering a question that needs the
 history cost the Dot $0.003 to $0.005 on average.

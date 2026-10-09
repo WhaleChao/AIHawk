@@ -18,7 +18,7 @@ is how it is built.
 ## [Studies](studies.md)
 
 - [How a Dot remembers](how-a-dot-remembers.md): past conversations as files,
-  a profile in every prompt, and the pass that keeps it current. 7.8% to 90.5%
+  a profile in every prompt, and the pass that keeps it current. 7.8% to 90.4%
   on LongMemEval.
 - [Agent memory systems, measured on the same questions](agent-memory-systems-compared.md):
   Mastra, LangMem, Hindsight, an agentic "dream" pass and a single request,

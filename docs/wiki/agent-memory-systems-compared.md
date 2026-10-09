@@ -84,7 +84,8 @@ question.
 
 The single request, as a background pass: once the Dot has been quiet for
 five minutes, the conversation files that changed go to the summary model with
-the current `MEMORY.md`, and the answer is the new `MEMORY.md`. From Mastra it
+the current `MEMORY.md`, and the answer is the new `MEMORY.md`. Run in the product on the 116 mixed questions it
+scored 90.4% (104 of 115 that ran), at $0.025 a pass. From Mastra it
 takes two ideas rather than code: reading in pieces when the new conversations
 do not fit one request, and saying that a changed fact replaces the old one.
 From LangMem, waiting for a quiet spell rather than running after every

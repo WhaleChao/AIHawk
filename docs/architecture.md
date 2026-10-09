@@ -1377,8 +1377,8 @@ are cut with a marker.
   and `memory.updated` (section 5.4) reports it. Measured on LongMemEval's
   questions that need what the person likes: 65% without MEMORY.md, 83% with
   it, the same as the best of the memory systems tried (Hindsight), at about a
-  seventeenth of its cost (~$0.015 a pass over 115K tokens with
-  glm-5.3-flash); Mastra's and LangMem's methods made 80%, an agent doing the
+  tenth of its cost ($0.025 a pass over 115K tokens with glm-5.3-flash, as
+  the product ran it; 90.4% of 115 mixed questions); Mastra's and LangMem's methods made 80%, an agent doing the
   pass with file tools 75% at five times the cost (`tests/bench/README.md`).
 - Workspace memory: `/home/dot/workspace` and `/home/dot/memory`, reached
   through the file tools.

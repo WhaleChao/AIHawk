@@ -650,19 +650,22 @@ check "the failure of t9 reports the spend of both processes: spent_usd 1.2" "wa
 check "t9 asked the model twice in all: once before the kill, once after" "[ \"\$(grep -c 'REPEAT-EXEC sleep 4' /tmp/fake-tools.jsonl)\" = 2 ]"
 
 # --- models.summary: a thread that outgrows its model's window is summarized by the role's model ---
-# smoke/small's window, as the stand-in publishes it, is 8000 tokens and its longest answer 4096, the room kept
-# for it; with the safety buffer of 1024 a request over 2880 tokens is compacted. The messages carry no tool result
-# to clear, so the summary model is asked; its own request has the same budget, and what does not fit of the thread
-# loses its oldest messages first. Each of the five messages is about 900 tokens, so the thread outgrows its budget
-# within them. The stand-in answers each message with the same short text.
+# smoke/small's window, as the stand-in publishes it, is 24000 tokens and its longest answer 4096, the room kept
+# for it; with the safety buffer of 1024 a request over 18880 tokens (as the engine sizes it: its estimate times
+# 1.35, nanobot/providers/prompt_count.py) is compacted. The Dot's first request, its prompt and the exec tools,
+# fits; each of the five messages is about 2100 tokens, so the thread outgrows the budget within them. The messages
+# carry no tool result to clear, so the summary model is asked; its own request has the same budget, and what does
+# not fit of the thread loses its oldest messages first. The stand-in answers each message with the same short text,
+# and every turn must answer it: a window too small for the Dot's own prompt fails every turn instead.
 echo '{"summary":"smoke/summarizer"}' > /tmp/models.json; echo smoke/small > /tmp/model.txt
-check "the host pushes a config with a summary model and a model of an 8000 token window (204 204)" "[ \"\$(push)\" = '204 204' ]"
-LONG=$(yes 'alpha beta gamma delta epsilon zeta' | head -n 130 | tr '\n' ' ')
+check "the host pushes a config with a summary model and a model of a 24000 token window (204 204)" "[ \"\$(push)\" = '204 204' ]"
+LONG=$(yes 'alpha beta gamma delta epsilon zeta' | head -n 300 | tr '\n' ' ')
 for n in 1 2 3 4 5; do
   ev "msg-long-$n" user.message "{\"text\":\"$n $LONG\"}" >/dev/null
   wait_event $STREAM ".type==\"message.assistant\" and .data.in_reply_to==\"msg-long-$n\"" || break
 done
 check "the five long messages were answered" "wait_event $STREAM '.type==\"message.assistant\" and .data.in_reply_to==\"msg-long-5\"'"
+check "each of them by the model, none with a failure" "grep '^data: ' $STREAM | sed 's/^data: //' | jq -s -e '[.[] | select(.type==\"message.assistant\" and ((.data.in_reply_to // \"\") | startswith(\"msg-long-\")))] | length == 5 and all(.[]; (.data.text | startswith(\"I could not answer\")) | not)' >/dev/null"
 check "a request went to the summary role's model, with no tool in it" "jq -s -e 'any(.[]; .model==\"smoke/summarizer\" and (.tools|length)==0)' /tmp/fake-tools.jsonl >/dev/null"
 check "every request the summary role's model got was offered no tool (it never answers a turn)" "jq -s -e '[.[] | select(.model==\"smoke/summarizer\")] | length > 0 and all(.[]; (.tools|length)==0)' /tmp/fake-tools.jsonl >/dev/null"
 check "the turns themselves went to the Dot's own model, offered the tools of the permission map" "jq -s -e '[.[] | select(.model==\"smoke/small\")] | length >= 5 and (last | .tools | index(\"exec\") != null)' /tmp/fake-tools.jsonl >/dev/null"
