@@ -535,6 +535,12 @@ def get_task_by_session(conn: sqlite3.Connection, session_key: str) -> TaskRow |
     )
 
 
+def list_tasks(conn: sqlite3.Connection) -> list[TaskRow]:
+    """Every task, in the order they arrived."""
+    rows = conn.execute(f"SELECT {_TASK_COLUMNS} FROM dots_tasks ORDER BY created_order").fetchall()
+    return [task for row in rows if (task := _task(row))]
+
+
 def get_running_task(conn: sqlite3.Connection) -> TaskRow | None:
     """The running task, if any (at most one runs)."""
     return _task(
@@ -702,7 +708,9 @@ def reset_spend(conn: sqlite3.Connection, session_key: str) -> None:
 
 
 # The events that report the spend of the session they belong to (architecture section 5.4).
-SPEND_EVENT_TYPES = ("message.assistant", "task.progress", "task.completed", "task.failed")
+SPEND_EVENT_TYPES = ("message.assistant", "task.progress", "task.completed", "task.failed", "memory.updated")
+# The events that end a unit of spend whose ledger then starts again: the chat's answer, and a memory pass.
+SPEND_RESET_EVENT_TYPES = ("message.assistant", "memory.updated")
 # USD are reported to the hundred-millionth: the cost OpenRouter reports has at most that many decimals,
 # and the sum of several of them must not show the noise of a float addition.
 SPENT_USD_DECIMALS = 8
@@ -719,12 +727,13 @@ def append_outbox_spent(
     The one place the spend of an event is told: a task's events carry the task's spend, the chat's
     `message.assistant` what the chat spent since its last answer. The answer takes that spend with it
     (the chat's row starts again), so each dollar of the chat is reported by exactly one answer, however
-    many turns it took to give it: a call parked for approval, a restart, a sleep.
+    many turns it took to give it: a call parked for approval, a restart, a sleep. A `memory.updated` does the
+    same for the memory passes (memory_update.py), a pass that failed included.
     """
     if event_type not in SPEND_EVENT_TYPES:
         raise ValueError(f"not an event that reports spend: {event_type}")
     spent = round(get_spend(conn, session_key), SPENT_USD_DECIMALS)
-    if event_type == "message.assistant":
+    if event_type in SPEND_RESET_EVENT_TYPES:
         reset_spend(conn, session_key)
     return append_outbox(conn, event_type, {**data, "spent_usd": spent})
 

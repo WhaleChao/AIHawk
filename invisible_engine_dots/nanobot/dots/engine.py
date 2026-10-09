@@ -22,6 +22,10 @@ runs, and what an outcome of a turn means; the turn itself is `TurnRunner`'s.
   holding the session) is given by a turn with no opening message: one rule
   for a restart, a prepare-sleep and any turn that ended early.
 
+- Once the Dot has been quiet for a while after a turn (and after a start), a memory pass brings MEMORY.md up
+  to date from the conversations that changed (`memory_update.py`). It runs beside nothing: a turn that starts
+  does not wait for it, and a pass waits for the next quiet spell when a turn runs.
+
 One asyncio loop runs everything; the one SQLite connection is used on it only.
 At most one chat turn and one task turn run at a time, and they may overlap.
 """
@@ -45,7 +49,8 @@ from nanobot.dots import store as dots_store
 from nanobot.dots.browser import CLOSE_TIMEOUT_S, BrowserManager
 from nanobot.dots.computer import Computer
 from nanobot.dots.gate import DotsGate, close_open_calls
-from nanobot.dots.permissions import tool_table
+from nanobot.dots.memory_update import QUIET_S, MemoryUpdater
+from nanobot.dots.permissions import tool_table, tool_target
 from nanobot.dots.projection import EngineSettings, project
 from nanobot.dots.protocol import (
     TASK_CANCELLED_EVENT,
@@ -68,7 +73,7 @@ from nanobot.dots.store import (
     InboundRow,
     ToolIntent,
 )
-from nanobot.dots.transcript_outbox import APPROVAL_ID, INBOUND_ID
+from nanobot.dots.transcript_outbox import APPROVAL_ID, APPROVAL_LINE, INBOUND_ID
 from nanobot.dots.turns import OpeningMessage, TurnOutcome, TurnRunner, TurnUnit
 
 # How many times a task may be started before an interruption fails it (architecture 8.7).
@@ -125,6 +130,14 @@ def _with_note(approval: Approval) -> str:
     return f' The user\'s note: "{approval.note}".' if approval.note else ""
 
 
+def approval_line(approval: Approval, approved: bool) -> str:
+    """What the Dot's conversation files say of a decision: the call and what it acted on (a target never shows a
+    secret), never the arguments the continuation hands the model."""
+    target = tool_target(approval.tool, approval.arguments)
+    call = f"the {approval.tool} call" + (f" ({target})" if target else "")
+    return f"The person {'approved' if approved else 'rejected'} {call}.{_with_note(approval)}"
+
+
 def approval_granted_continuation(approval: Approval) -> str:
     # The arguments as JSON with no spaces: the model reads them back and makes the call with exactly these.
     arguments = json.dumps(approval.arguments, separators=(",", ":"), ensure_ascii=False)
@@ -174,6 +187,7 @@ class Engine:
         workspace: str,
         openrouter_base_url: str | None = None,
         stop_grace_s: float = STOP_GRACE_S,
+        memory_quiet_s: float = QUIET_S,
     ) -> None:
         self._store = store
         self._computer = computer
@@ -195,6 +209,20 @@ class Engine:
         self._turns: dict[Slot, _Turn] = {}
         self._pumping = False
         self._repump = False
+        # The memory pass: whether one is owed (a turn ended, or the process started, since the last), since when
+        # the Dot has been quiet, the timer that looks again once it has been long enough, and the pass running.
+        self._memory_quiet_s = memory_quiet_s
+        self._memory_due = True
+        self._quiet_since = 0.0
+        self._memory_timer: asyncio.TimerHandle | None = None
+        self._memory_pass: asyncio.Task[None] | None = None
+        self._memory = MemoryUpdater(
+            store=store,
+            computer=computer,
+            providers=providers,
+            key_holder=key_holder,
+            settings_getter=lambda: self._settings,
+        )
         self._runner = TurnRunner(
             store=store,
             computer=computer,
@@ -295,6 +323,7 @@ class Engine:
             except DotsConfigError as error:
                 logger.error("the stored Dot config is not valid, waiting for the host to push one: {}", error)
         self._started = True
+        self._quiet_since = asyncio.get_running_loop().time()
         logger.info("Dot engine started configured={} interrupted_calls={}", self._config is not None, interrupted)
         self.kick()
 
@@ -445,6 +474,13 @@ class Engine:
 
     async def _suspend_now(self) -> None:
         loop = asyncio.get_running_loop()
+        # A memory pass is only bookkeeping: it stops at once, and the next quiet spell takes it up again.
+        if self._memory_timer is not None:
+            self._memory_timer.cancel()
+            self._memory_timer = None
+        if self._memory_pass is not None:
+            self._memory_pass.cancel()
+            await asyncio.wait([self._memory_pass], timeout=_CANCEL_WAIT_S)
         deadline = loop.time() + self._stop_grace_s
         cut_task = next(
             (turn.unit.task_id for turn in self._turns.values() if turn.counted_attempt and turn.unit.task_id),
@@ -544,6 +580,43 @@ class Engine:
         self._pump_approvals()
         self._pump_chat()
         self._pump_task()
+        self._pump_memory()
+
+    def _pump_memory(self) -> None:
+        """Start the memory pass that is owed once no turn has run for `memory_quiet_s`."""
+        if self._memory_pass is not None or not self._memory_due or self._turns:
+            return
+        loop = asyncio.get_running_loop()
+        wait = self._quiet_since + self._memory_quiet_s - loop.time()
+        if wait > 0:
+            if self._memory_timer is None:
+                self._memory_timer = loop.call_later(wait, self._memory_timer_fired)
+            return
+        self._memory_due = False
+        memory_pass = loop.create_task(self._run_memory_pass(), name="memory pass")
+        self._memory_pass = memory_pass
+        memory_pass.add_done_callback(self._memory_pass_done)
+
+    def _memory_timer_fired(self) -> None:
+        self._memory_timer = None
+        self.kick()
+
+    async def _run_memory_pass(self) -> None:
+        try:
+            outcome = await self._memory.run()
+        except asyncio.CancelledError:
+            # Cut by a sleep or a stop: it is owed again, and what it took in so far is kept.
+            self._memory_due = True
+            raise
+        if outcome.kind == "failed":
+            # Owed again only once a turn ends: a pass that fails at once is not tried over and over.
+            logger.warning("memory pass failed: {}", outcome.reason)
+
+    def _memory_pass_done(self, done: asyncio.Task[None]) -> None:
+        self._memory_pass = None
+        if not done.cancelled() and done.exception() is not None:
+            logger.opt(exception=done.exception()).error("memory pass failed")
+        self.kick()
 
     def _pump_approvals(self) -> None:
         """Decided approvals: tell the session that made the call."""
@@ -568,7 +641,7 @@ class Engine:
         approved = source == "approved"
         telling = "granted" if approved else "told"
         text = approval_granted_continuation(approval) if approved else approval_rejected_continuation(approval)
-        opening = (OpeningMessage(text, {APPROVAL_ID: approval_id}),)
+        opening = (OpeningMessage(text, {APPROVAL_ID: approval_id, APPROVAL_LINE: approval_line(approval, approved)}),)
         if approval.session_key == CHAT_SESSION_KEY:
             if "chat" in self._turns:
                 # Its end kicks again.
@@ -678,6 +751,9 @@ class Engine:
     def _turn_done(self, turn: _Turn, done: asyncio.Task[bool]) -> None:
         if self._turns.get(turn.slot) is turn:
             del self._turns[turn.slot]
+        # The turn wrote its conversation: a memory pass is owed once the Dot has been quiet again.
+        self._memory_due = True
+        self._quiet_since = asyncio.get_running_loop().time()
         if not done.cancelled() and done.exception() is not None:
             logger.error("turn task failed session={} error={!r}", turn.unit.session_key, done.exception())
         elif not done.cancelled() and not done.result() and turn.slot == "chat":

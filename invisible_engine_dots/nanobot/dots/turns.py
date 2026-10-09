@@ -37,8 +37,9 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.gate_types import ToolGate
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.transcript_metadata import METADATA_KEY
+from nanobot.dots import conversations
 from nanobot.dots import store as dots_store
-from nanobot.dots.computer import Computer, ComputerError, Entry
+from nanobot.dots.computer import Computer, ComputerError, Entry, FileTooLargeError
 from nanobot.dots.gate import close_open_calls
 from nanobot.dots.images import TurnImages, bind_turn_images, reset_turn_images
 from nanobot.dots.permissions import tool_starts_terminal, tool_target
@@ -57,6 +58,11 @@ from nanobot.utils.llm_runtime import LLMRuntime
 MEMORY_DIR = "/home/dot/memory"
 # How many of the most recently changed memory notes the prompt names.
 MEMORY_NOTES_LISTED = 20
+# The note the prompt carries whole: what the Dot always knows, and what its other notes hold.
+MEMORY_INDEX = "MEMORY.md"
+# The most of it the prompt carries, as Claude Code does with its own MEMORY.md (25KB); the rest is cut, and
+# the Dot is told to make it shorter.
+MEMORY_INDEX_MAX_CHARS = 25_000
 
 
 class TurnAbandoned(Exception):
@@ -251,15 +257,15 @@ class TurnRunner:
             "turn start session={} task={} approval={}", unit.session_key, unit.task_id, unit.approval_id,
         )
         try:
-            return await self._run(unit, settings)
+            outcome = await self._run(unit, settings)
         except TurnAbandoned:
-            return TurnOutcome("abandoned")
+            outcome = TurnOutcome("abandoned")
         except CostCapReached as exc:
-            return TurnOutcome.failed(str(exc))
+            outcome = TurnOutcome.failed(str(exc))
         except ContextWindowExceededError as exc:
             # Said in words: the error's own text ("6371/0 via tiktoken") reached the chat as it was. The window is
             # the model's own, so what is left to change is the model, or what the request carries.
-            return TurnOutcome.failed(
+            outcome = TurnOutcome.failed(
                 f"the request needs {exc.estimated_tokens} tokens and the model {settings.model_id} takes "
                 f"{exc.input_budget} once the room for its answer is kept, even with the older part of the thread "
                 "summarised; choose a model with a larger context window"
@@ -268,7 +274,9 @@ class TurnRunner:
             raise
         except Exception as exc:
             logger.opt(exception=True).error("turn failed for {}", unit.session_key)
-            return TurnOutcome.failed(str(exc) or type(exc).__name__)
+            outcome = TurnOutcome.failed(str(exc) or type(exc).__name__)
+        await self._write_conversations(unit)
+        return outcome
 
     async def _run(self, unit: TurnUnit, settings: EngineSettings) -> TurnOutcome:
         session_key = unit.session_key
@@ -293,11 +301,11 @@ class TurnRunner:
         )
         provider = spend.meter(self._providers.current(settings, self._key_holder.require()))
         # Every request uses the whole of what its model can do: its own context window and longest answer.
-        runtime = LLMRuntime.at_model_limits(provider, settings.model_id, await _limits_of(provider, settings.model_id))
+        runtime = LLMRuntime.at_model_limits(provider, settings.model_id, await limits_of(provider, settings.model_id))
         # The summary of an outgrown thread may be written by another model (the `summary` role), through
         # the same metered provider, so its cost counts; it works within its own limits.
         summary_model = settings.model_for("summary")
-        summary_runtime = LLMRuntime.at_model_limits(provider, summary_model, await _limits_of(provider, summary_model))
+        summary_runtime = LLMRuntime.at_model_limits(provider, summary_model, await limits_of(provider, summary_model))
         tools = self._base_registry.view(settings.offered_tools)
         # What the tools of this turn returned for the model to look at, and the transcript does not keep.
         images = TurnImages()
@@ -306,6 +314,7 @@ class TurnRunner:
             workspace=settings.workspace,
             memory_dir=MEMORY_DIR,
             memory_notes=await self._recent_notes(),
+            memory_index=await self._memory_index(),
             now=datetime.now().astimezone(),
             skills=await all_skills(self._computer),
         )
@@ -403,6 +412,60 @@ class TurnRunner:
         except ValueError as exc:
             logger.warning("ignoring the summary checkpoint of {}: {}", session_key, exc)
 
+    async def _write_conversations(self, unit: TurnUnit) -> None:
+        """Write what the turn said to the Dot's conversation files (`conversations`).
+
+        The chat's files from the first message not yet written, a task's whole file; the first write
+        after an upgrade writes the chat from its start and every task. A file that cannot be written now is
+        written by a later turn: the count of the chat's written messages moves only once all are.
+        """
+
+        key = [self._key_holder.require()] if self._key_holder.configured else []
+
+        def read(conn: sqlite3.Connection) -> tuple[dict[str, str], int]:
+            written = dots_store.read_kv(conn, conversations.KV_CHAT_WRITTEN)
+            secrets = [*conversations.known_secrets(conn), *key]
+            files: dict[str, str] = {}
+            tasks = (
+                dots_store.list_tasks(conn)
+                if written is None
+                else [task for task in [dots_store.get_task_by_session(conn, unit.session_key)] if task]
+            )
+            for task in tasks:
+                messages = dots_store.load_session(conn, task.session_key).messages
+                files.update(
+                    conversations.task_file(task.task_id, task.status, messages, target=tool_target, secrets=secrets)
+                )
+            chat = dots_store.load_session(conn, CHAT_SESSION_KEY).messages
+            since = written or 0
+            files.update(conversations.chat_files(chat, since, target=tool_target, secrets=secrets))
+            return files, len(chat)
+
+        # A write: the secrets the files must not hold are gathered for good as they are read.
+        files, chat_length = self._store.write(read)
+        try:
+            for path, text in files.items():
+                await self._computer.write_bytes(f"{conversations.CONVERSATIONS_DIR}/{path}", text.encode("utf-8"))
+        except (ComputerError, OSError) as exc:
+            logger.warning("could not write the conversation files: {}", exc)
+            return
+        self._store.write(lambda conn: dots_store.write_kv(conn, conversations.KV_CHAT_WRITTEN, chat_length))
+
+    async def _memory_index(self) -> str:
+        """The text of the Dot's MEMORY.md, cut at MEMORY_INDEX_MAX_CHARS; empty when it has none."""
+        try:
+            data = await self._computer.read_bytes(f"{MEMORY_DIR}/{MEMORY_INDEX}")
+        except (ComputerError, FileTooLargeError) as exc:
+            logger.warning("could not read {}: {}", MEMORY_INDEX, exc)
+            return ""
+        text = (data or b"").decode("utf-8", errors="replace").strip()
+        if len(text) > MEMORY_INDEX_MAX_CHARS:
+            return (
+                f"{text[:MEMORY_INDEX_MAX_CHARS]}\n\n(MEMORY.md is cut here, at {MEMORY_INDEX_MAX_CHARS} characters: "
+                "make it shorter, moving details into other notes.)"
+            )
+        return text
+
     async def _recent_notes(self) -> list[str]:
         """Names of the most recently changed memory notes, newest first."""
         try:
@@ -416,7 +479,7 @@ class TurnRunner:
         return [entry.name for entry in notes[:MEMORY_NOTES_LISTED]]
 
 
-async def _limits_of(provider: Any, model: str) -> ModelLimits:
+async def limits_of(provider: Any, model: str) -> ModelLimits:
     """The limits OpenRouter publishes for `model`; a turn cannot run without them."""
     try:
         return cast(ModelLimits, await provider.model_limits(model))

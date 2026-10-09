@@ -43,8 +43,9 @@ from nanobot.dots import store as dots_store
 from nanobot.dots.store import DotStore
 from nanobot.providers.base import LLMResponse
 
-# What the cap is a cap of, in the text that says it was reached: a task, or the chat's next answer.
-Scope = Literal["task", "turn"]
+# What the cap is a cap of, in the text that says it was reached: a task, the chat's next answer, or a pass that
+# brings MEMORY.md up to date (memory_update.py).
+Scope = Literal["task", "turn", "memory pass"]
 
 
 class CostCapReached(Exception):

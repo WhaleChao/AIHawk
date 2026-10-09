@@ -11,13 +11,13 @@ NOW = datetime(2026, 10, 5, 14, 30, tzinfo=timezone.utc)
 DOT = 'You are the Dot "fare-watch".'
 
 
-def builder(memory_notes: tuple[str, ...] = ()) -> ContextBuilder:
+def builder(memory_notes: tuple[str, ...] = (), now: datetime = NOW) -> ContextBuilder:
     return ContextBuilder(
         DOT,
         workspace="/home/dot/workspace",
         memory_dir="/home/dot/memory",
         memory_notes=memory_notes,
-        now=NOW,
+        now=now,
     )
 
 
@@ -30,9 +30,17 @@ def test_the_system_prompt_is_the_dot_the_tool_contract_and_its_computer() -> No
     assert "You run on your own Linux computer." in sections[2]
     assert "run as the user dot" in sections[2]
     assert "Your workspace is /home/dot/workspace." in sections[2]
-    assert "The current time is 2026-10-05 14:30 UTC." in sections[2]
+    assert "Today is 2026-10-05 (Monday) UTC. For the time, run `date`." in sections[2]
     assert "untrusted external data" in sections[2]
     assert len(sections) == 3
+
+
+def test_the_system_prompt_is_the_same_all_day() -> None:
+    # A prompt that changed every turn would miss the provider's cache and its count of the prompt.
+    morning = builder(now=NOW.replace(hour=0, minute=1)).build_system_prompt()
+
+    assert builder(now=NOW.replace(hour=23, minute=59)).build_system_prompt() == morning
+    assert builder(now=NOW.replace(day=6, hour=0, minute=1)).build_system_prompt() != morning
 
 
 def test_nothing_of_the_upstream_assistants_identity_or_platform_is_left() -> None:
@@ -46,7 +54,8 @@ def test_nothing_of_the_upstream_assistants_identity_or_platform_is_left() -> No
 def test_the_memory_section_says_the_dot_keeps_its_notes_itself_with_the_file_tools() -> None:
     prompt = builder().build_system_prompt()
 
-    assert "Your long-term memory is /home/dot/memory, one note per file, and you keep it yourself" in prompt
+    assert "Your long-term memory is /home/dot/memory, and you keep it yourself" in prompt
+    assert "`MEMORY.md` there is given to you in every conversation and task" in prompt
     for tool in ("grep", "find_files", "read_file", "write_file", "edit_file"):
         assert tool in prompt
     assert "Most recently changed notes" not in prompt
@@ -104,3 +113,18 @@ def test_with_no_current_message_the_transcript_ends_with_the_history() -> None:
     messages = builder().build_transcript(TranscriptInput(history=history, current_message=None))
 
     assert messages[1:] == history
+
+
+def test_memory_md_is_carried_whole_under_the_memory_section() -> None:
+    prompt = ContextBuilder(
+        DOT,
+        workspace="/home/dot/workspace",
+        memory_dir="/home/dot/memory",
+        memory_notes=(),
+        now=NOW,
+        memory_index="- has a cat named Luna (2023-05-20)",
+    ).build_system_prompt()
+
+    memory = prompt[prompt.index("## Memory") : prompt.index("## Past conversations")]
+    assert "### MEMORY.md\n- has a cat named Luna (2023-05-20)" in memory
+    assert "### MEMORY.md" not in builder().build_system_prompt()

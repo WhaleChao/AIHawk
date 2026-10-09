@@ -206,8 +206,8 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "data": [
                         model("openai/gpt-4o-mini", 128000, 16384),
-                        model("smoke/small", 8000, 4096),
-                        model("smoke/summarizer", 8000, 4096),
+                        model("smoke/small", 24000, 4096),
+                        model("smoke/summarizer", 24000, 4096),
                     ]
                 },
             )

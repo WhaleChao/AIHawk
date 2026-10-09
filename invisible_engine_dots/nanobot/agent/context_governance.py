@@ -674,6 +674,13 @@ class ContextGovernor:
         state.messages = deepcopy(prepared)
         state.tool_definitions = deepcopy(tool_definitions)
         state.answer_tokens = self.answer_tokens(state.config, prompt_tokens)
+        logger.info(
+            "request for {}: prompt {} tokens ({}), answer limit {}",
+            state.config.session_key or "default",
+            prompt_tokens,
+            measurement[1] if measurement is not None else "no window",
+            state.answer_tokens,
+        )
         return prepared, provider_context
 
     @staticmethod

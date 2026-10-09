@@ -2,19 +2,20 @@
 # Runs a benchmark on real Dots (tests/bench/README.md), inside the bench container, from /work/dots:
 #
 #   bash tests/bench/run.sh <agent> <harbor run arguments...>
+#   bash tests/bench/run.sh longmemeval run <longmemeval.py run arguments...>
 #
 # <agent> is "dot" (the Dot does each task), "oracle" (each task's reference solution: proves the task, its
 # grader and its replay in a Dot) or "nop" (does nothing: the grader must give 0). It starts the server,
-# stores the key from E2E_OPENROUTER_KEY_FILE, runs `harbor run` with the Dot environment and stops the
-# server. TEST HARNESS ONLY.
+# stores the key from E2E_OPENROUTER_KEY_FILE, runs `harbor run` with the Dot environment (or
+# longmemeval.py) and stops the server. TEST HARNESS ONLY.
 set -euo pipefail
 
-agent=${1:?usage: run.sh dot|oracle|nop <harbor run arguments...>}
+agent=${1:?usage: run.sh dot|oracle|nop|longmemeval <arguments...>}
 shift
 case "$agent" in
   dot) agent=dots_harbor.agent:DotAgent ;;
-  oracle | nop) ;;
-  *) echo "run.sh: unknown agent $agent (dot, oracle, nop)" >&2; exit 2 ;;
+  oracle | nop | longmemeval) ;;
+  *) echo "run.sh: unknown agent $agent (dot, oracle, nop, longmemeval)" >&2; exit 2 ;;
 esac
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
@@ -31,5 +32,9 @@ stop_server() {
 trap stop_server EXIT
 
 node tests/bench/bridge.ts ready "${E2E_OPENROUTER_KEY_FILE:?set E2E_OPENROUTER_KEY_FILE}"
+if [ "$agent" = longmemeval ]; then
+  python3 tests/bench/longmemeval.py "$@"
+  exit
+fi
 PYTHONPATH="$repo/tests/bench${PYTHONPATH:+:$PYTHONPATH}" \
   harbor run -e dots_harbor.environment:DotEnvironment -a "$agent" -o "${BENCH_JOBS_DIR:-/work/bench-jobs}" "$@"

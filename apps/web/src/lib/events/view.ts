@@ -19,7 +19,7 @@ import type { Tone } from "../tone";
 import { toolLabel } from "./tool-labels";
 
 /** What the Activity page filters by: one family per kind of thing that happens to a Dot. */
-export const EVENT_FAMILIES = ["chat", "tasks", "tools", "approvals", "browser", "computer", "channels", "dot"] as const;
+export const EVENT_FAMILIES = ["chat", "tasks", "tools", "approvals", "memory", "browser", "computer", "channels", "dot"] as const;
 export type EventFamily = (typeof EVENT_FAMILIES)[number];
 
 export const FAMILY_LABELS: Record<EventFamily, string> = {
@@ -27,6 +27,7 @@ export const FAMILY_LABELS: Record<EventFamily, string> = {
   tasks: "Tasks",
   tools: "Tools",
   approvals: "Approvals",
+  memory: "Memory",
   browser: "Browser",
   computer: "Computer",
   channels: "Channels",
@@ -50,6 +51,7 @@ const FAMILY_OF: Record<KnownType, EventFamily> = {
   "tool.called": "tools",
   "approval.requested": "approvals",
   "approval.resolved": "approvals",
+  "memory.updated": "memory",
   "browser.identity.created": "browser",
   "browser.identity.deleted": "browser",
   "browser.identity.launched": "browser",
@@ -212,6 +214,13 @@ const DESCRIBE: { [K in KnownType]: (data: Partial<EventData[K]>) => Draft } = {
     title: "Next automation",
     detail: typeof d.next_run_at_ms === "number" ? `due ${new Date(d.next_run_at_ms).toISOString()}` : "none due",
     tone: "neutral",
+  }),
+  // The Dot brought MEMORY.md, what it is given about the person in every prompt, up to date from its conversations.
+  "memory.updated": (d) => ({
+    title: d.changed === false ? "Memory checked, nothing new" : "Memory updated",
+    detail:
+      typeof d.conversations === "number" ? `from ${d.conversations} conversation${d.conversations === 1 ? "" : "s"}` : "",
+    tone: d.changed === false ? "neutral" : "info",
   }),
   // The engine sent something the control plane could not read, so it is not in this log: this row is all there is of it.
   "guest.event.refused": (d) => ({

@@ -28,6 +28,7 @@ from nanobot.providers.base import (
     parse_tool_arguments,
     tool_arguments_json_for_replay,
 )
+from nanobot.providers.prompt_count import PromptCounts
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI as AsyncOpenAIType
@@ -390,6 +391,8 @@ class OpenAICompatProvider(LLMProvider):
         # The limits of every model the endpoint lists, read once (GET /models) when a request first needs them.
         self._model_limits: dict[str, ModelLimits] | None = None
         self._model_limits_lock = asyncio.Lock()
+        # What the endpoint counted of the prompts it took, which sizes the next requests (prompt_count.py).
+        self._prompt_counts = PromptCounts()
 
     def _build_client(self) -> None:
         """Create the OpenAI client using the current module-level AsyncOpenAI."""
@@ -1182,9 +1185,19 @@ class OpenAICompatProvider(LLMProvider):
                     completed |= bool(chunk.choices[0].finish_reason)
             if not completed:
                 raise ConnectionError("Model stream ended before a finish reason was received")
-            return self._parse_chunks(chunks)
+            response = self._parse_chunks(chunks)
+            usage = response.usage
+            if usage is not None and usage.input_tokens > 0 and usage.estimated_tokens == 0:
+                self._prompt_counts.observe(model or self.default_model, messages, tools, usage.input_tokens)
+            return response
         except Exception as e:
             return self._handle_error(e)
+
+    def estimate_prompt_tokens(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, model: str | None
+    ) -> tuple[int, str]:
+        """The tokens this endpoint will count for the prompt, from what it counted before (prompt_count.py)."""
+        return self._prompt_counts.estimate(model or self.default_model, messages, tools)
 
     def get_default_model(self) -> str:
         return self.default_model

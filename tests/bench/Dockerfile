@@ -9,6 +9,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /opt/harbor \
  && /opt/harbor/bin/pip install --no-cache-dir harbor==0.24.0
+# LongMemEval's grader (longmemeval.py): its source at a fixed commit, and what its evaluate_qa.py imports.
+RUN git clone -q https://github.com/xiaowu0162/LongMemEval.git /opt/longmemeval \
+ && git -C /opt/longmemeval checkout -q 9e0b455f4ef0e2ab8f2e582289761153549043fc \
+ && /opt/harbor/bin/pip install --no-cache-dir openai backoff tqdm numpy
 ENV PATH=/opt/harbor/bin:$PATH
 USER dots
 WORKDIR /work

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
+from nanobot.dots.conversations import CONVERSATIONS_DIR
 from nanobot.dots.skills import DOT_SKILLS_DIR, Skill
 from nanobot.session.summary import SessionSummary
 from nanobot.utils.prompt_templates import render_template
@@ -31,17 +32,20 @@ class ContextBuilder:
         memory_dir: str,
         memory_notes: Sequence[str],
         now: datetime,
+        memory_index: str = "",
         skills: Sequence[Skill] = (),
     ) -> None:
         """`dot_prompt` says whose Dot this is and what it is for (projection.py).
 
-        `memory_notes` are the names of the most recently changed notes in `memory_dir`; `skills` are the Dot's
+        `memory_notes` are the names of the most recently changed notes in `memory_dir`, `memory_index` the
+        text of its MEMORY.md (what the Dot always knows); `skills` are the Dot's
         skills (nanobot/dots/skills.py), named in the prompt with their descriptions and paths.
         """
         self.dot_prompt = dot_prompt
         self.workspace = workspace
         self.memory_dir = memory_dir
         self.memory_notes = memory_notes
+        self.memory_index = memory_index
         self.skills = skills
         self.now = now
 
@@ -55,9 +59,13 @@ class ContextBuilder:
                 workspace=self.workspace,
                 memory_dir=self.memory_dir,
                 memory_notes=list(self.memory_notes),
+                memory_index=self.memory_index,
+                conversations_dir=CONVERSATIONS_DIR,
                 skills=list(self.skills),
                 dot_skills_dir=DOT_SKILLS_DIR,
-                now=self.now.strftime("%Y-%m-%d %H:%M %Z").strip(),
+                # The day, not the minute: the prompt then stays the same all day, so the provider's cache of it
+                # and its count of the prompt (prompt_count.py) hold from one turn to the next.
+                today=self.now.strftime("%Y-%m-%d (%A) %Z").strip(),
             ),
         ]
         if session_summary and session_summary["text"] != "(nothing)":

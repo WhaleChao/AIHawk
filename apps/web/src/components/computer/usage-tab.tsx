@@ -1,7 +1,7 @@
 "use client";
 
 import { AlertCircleIcon, PlayIcon, RefreshCwIcon, RotateCwIcon, SquareIcon } from "lucide-react";
-import { computerIsUp } from "@invisible-dots/shared/browser";
+import { computerIsUp, USAGE_EVENT_TYPES } from "@invisible-dots/shared/browser";
 import type { ReactNode } from "react";
 import { api } from "../../lib/api";
 import { allowedActions, computerView, taskRunning, type Usage } from "../../lib/computer";
@@ -19,7 +19,6 @@ import { AutomationsNote } from "./automations-note";
 import { ComputerStatus } from "./computer-status";
 
 const COMPUTER_EVENTS = ["computer.state", "computer.started", "computer.stopped"];
-const SPEND_EVENTS = ["message.assistant", "task.completed", "task.failed"];
 
 /** A bar of how much of a resource is used: amber from three quarters, red from nine tenths. */
 function Meter({ label, usage }: { label: string; usage: Usage }) {
@@ -62,7 +61,7 @@ function Spend({ dotId }: { dotId: string }) {
   useLiveRefresh(() => {
     today.reload();
     total.reload();
-  }, SPEND_EVENTS);
+  }, USAGE_EVENT_TYPES);
   return (
     <Card id="usage-spend" title="Model spend">
       <ErrorAlert error={today.error ?? total.error} title="Could not read the spend" />

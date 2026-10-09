@@ -21,7 +21,7 @@ import { ComputerOff } from "./computer-off";
 import { FilePreview } from "./file-preview";
 
 /** What the Dot does that adds or changes files: the page reads the folder again after each. */
-const FILE_EVENTS = ["task.completed", "task.failed", "message.assistant"];
+const FILE_EVENTS = ["task.completed", "task.failed", "message.assistant", "memory.updated"];
 
 /** The sentence for a folder that could not be listed, for the answers a person can do something about. */
 function listProblem(error: unknown): string | null {
