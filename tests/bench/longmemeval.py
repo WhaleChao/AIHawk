@@ -50,6 +50,18 @@ LONGMEMEVAL = Path(os.environ.get("LONGMEMEVAL_DIR", "/opt/longmemeval"))
 TASK_TIMEOUT_MS = 60 * 60 * 1000
 
 
+async def call(command: str, *args: str, stdin: bytes = b"") -> Any:
+    """A bridge command with a bound: a call that never returns is an error, not a run that waits forever (four
+    questions once waited seven hours on a finished exec). The bound is the command's own wait, with room."""
+    if command == "task":
+        bound = int(args[1]) / 1000 + 600
+    elif command == "exec":
+        bound = int(args[1]) / 1000 + 120
+    else:
+        bound = 30 * 60
+    return await bridge.call(command, *args, stdin=stdin, timeout_s=bound)
+
+
 def subset(questions: list[dict[str, Any]], size: int) -> list[dict[str, Any]]:
     """`size` questions with the benchmark's share of each kind (largest remainder), drawn with a fixed seed."""
     by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -110,8 +122,8 @@ async def give_history(dot_id: str, question: dict[str, Any], history: str) -> N
     if history == "none":
         return
     sessions = {"dates": question["haystack_dates"], "sessions": question["haystack_sessions"]}
-    await bridge.call("put", dot_id, HISTORY_JSON, stdin=json.dumps(sessions).encode())
-    result = await bridge.call(
+    await call("put", dot_id, HISTORY_JSON, stdin=json.dumps(sessions).encode())
+    result = await call(
         "exec", dot_id, "120000", stdin=f"/opt/invisible-dots-engine/bin/python -I -B - <<'PY'\n{WRITE_CHAT_FILES}\nPY\n".encode()
     )
     if result["exit_code"] != 0:
@@ -133,12 +145,12 @@ print(render_template("agent/dream.md", conversations=files, memory_dir=MEMORY_D
 
 async def dream(dot_id: str) -> dict[str, Any]:
     """The memory pass over the history, as a task before the question."""
-    rendered = await bridge.call(
+    rendered = await call(
         "exec", dot_id, "120000", stdin=f"/opt/invisible-dots-engine/bin/python -I -B - <<'PY'\n{DREAM_PROMPT}\nPY\n".encode()
     )
     if rendered["exit_code"] != 0:
         raise RuntimeError(f"rendering the memory pass failed: {rendered['stderr'][-1500:]}")
-    return await bridge.call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=rendered["stdout"].encode())
+    return await call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=rendered["stdout"].encode())
 
 
 # Run by the engine's own Python in the Dot: the one request that writes MEMORY.md from the conversations
@@ -168,7 +180,7 @@ print(json.dumps([{"path": str(f), "text": f.read_text(encoding="utf-8")} for f 
 
 
 async def _engine_python(dot_id: str, script: str, what: str) -> str:
-    result = await bridge.call(
+    result = await call(
         "exec", dot_id, "120000", stdin=f"/opt/invisible-dots-engine/bin/python -I -B - <<'PY'\n{script}\nPY\n".encode()
     )
     if result["exit_code"] != 0:
@@ -251,7 +263,7 @@ async def profile(dot_id: str, variant: str, question: dict[str, Any]) -> dict[s
 
         conversations = json.loads(await _engine_python(dot_id, CONVERSATIONS_JSON, "reading the conversations"))
         text, usages = await memory_variants.write_memory(variant, conversations, "", complete)
-    await bridge.call("put", dot_id, "/home/dot/memory/MEMORY.md", stdin=(text + "\n").encode())
+    await call("put", dot_id, "/home/dot/memory/MEMORY.md", stdin=(text + "\n").encode())
     return {
         "profile_variant": variant,
         "profile_calls": len(usages),
@@ -265,7 +277,7 @@ async def profile(dot_id: str, variant: str, question: dict[str, Any]) -> dict[s
 async def answer(question: dict[str, Any], history: str, out: Path, with_dream: bool, profile_variant: str | None) -> dict[str, Any]:
     name = f"bench-lme-{hashlib.sha256(question['question_id'].encode()).hexdigest()[:10]}"
     started = time.monotonic()
-    created = await bridge.call("create", name, stdin=dot_yaml(name, cpus=2, memory_gb=4).encode())
+    created = await call("create", name, stdin=dot_yaml(name, cpus=2, memory_gb=4).encode())
     dot_id = created["id"]
     try:
         await give_history(dot_id, question, history)
@@ -274,26 +286,26 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
         if with_dream:
             (out / "dream-events").mkdir(exist_ok=True)
             (out / "dream-events" / f"{question['question_id']}.json").write_text(
-                json.dumps(await bridge.call("events", dot_id, dreamt["id"]), indent=1), encoding="utf-8"
+                json.dumps(await call("events", dot_id, dreamt["id"]), indent=1), encoding="utf-8"
             )
-        task = await bridge.call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=task_text(question).encode())
-        events = await bridge.call("events", dot_id, task["id"])
+        task = await call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=task_text(question).encode())
+        events = await call("events", dot_id, task["id"])
         (out / "events").mkdir(exist_ok=True)
         (out / "events" / f"{question['question_id']}.json").write_text(json.dumps(events, indent=1), encoding="utf-8")
         # The engine's own log goes with the Dot: kept for every question, since a wrong answer is known only
         # once judged.
-        journal = await bridge.call(
+        journal = await call(
             "exec", dot_id, "60000", stdin=b"journalctl -u invisible-dots-agent --no-pager -o cat | tail -n 3000"
         )
         (out / "engine").mkdir(exist_ok=True)
         (out / "engine" / f"{question['question_id']}.log").write_text(journal["stdout"] or journal["stderr"], encoding="utf-8")
         if with_dream or profile_variant:
             # What the memory pass left the question to work from.
-            memory = await bridge.call("exec", dot_id, "60000", stdin=b"cat /home/dot/memory/MEMORY.md")
+            memory = await call("exec", dot_id, "60000", stdin=b"cat /home/dot/memory/MEMORY.md")
             (out / "memory").mkdir(exist_ok=True)
             (out / "memory" / f"{question['question_id']}.md").write_text(memory["stdout"], encoding="utf-8")
     finally:
-        await bridge.call("delete", dot_id)
+        await call("delete", dot_id)
     return {
         "question_id": question["question_id"],
         "hypothesis": task.get("summary") or "",
