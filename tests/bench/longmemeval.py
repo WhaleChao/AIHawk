@@ -200,6 +200,13 @@ async def external_memory(dot_id: str, variant: str, question: dict[str, Any]) -
         "model": os.environ.get("BENCH_MODEL", "z-ai/glm-5.3-flash"),
         "embedding_model": "openai/text-embedding-3-small",
         "letta_url": LETTA_URL,
+        "question_id": question["question_id"],
+        # Mem0 per session rather than per pair (its own runner's choice), at about a fifth of the calls.
+        "add_per": "session",
+        # What Hindsight recalls, kept within the 25,000 characters a Dot carries of MEMORY.md (its benchmark asks
+        # for 32768 + 16384 tokens): its own ranking chooses, not a cut.
+        "recall_max_tokens": 4000,
+        "chunk_max_tokens": 2000,
     }
     process = await asyncio.create_subprocess_exec(
         f"/opt/mem-{variant}/bin/python",
@@ -311,6 +318,8 @@ async def run(args: argparse.Namespace) -> None:
         questions = sorted((q for q in every if q["question_type"] == args.kind), key=lambda q: q["question_id"])
     else:
         questions = subset(every, args.questions)
+    if args.limit:
+        questions = questions[: args.limit]
     done = {row["question_id"] for row in read_jsonl(out / "hypotheses.jsonl")}
     todo = [q for q in questions if q["question_id"] not in done]
     print(f"{len(questions)} questions, {len(done)} answered, {len(todo)} to go, {args.n} at once", flush=True)
@@ -425,6 +434,7 @@ def main() -> None:
     )
     commands.choices["run"].add_argument("--questions", type=int, default=116)
     commands.choices["run"].add_argument("--kind", help="every question of this question_type instead of the subset")
+    commands.choices["run"].add_argument("--limit", type=int, help="only the first N of the questions (a pilot)")
     commands.choices["run"].add_argument("-n", type=int, default=4)
     args = parser.parse_args()
     if args.command == "run":
