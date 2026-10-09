@@ -176,7 +176,46 @@ async def _engine_python(dot_id: str, script: str, what: str) -> str:
     return result["stdout"]
 
 
-async def profile(dot_id: str, variant: str) -> dict[str, Any]:
+# Memory systems that run as their own programs, each in its venv in the bench container (memory_<name>.py), calling
+# the model through the metering proxy (openrouter_meter.py), which records what each question cost.
+EXTERNAL = ("mem0", "hindsight", "letta")
+METER_PORT = 8790
+METER_LOG = Path(os.environ.get("BENCH_METER_LOG", "/work/bench-jobs/meter.jsonl"))
+LETTA_URL = os.environ.get("BENCH_LETTA_URL", "http://127.0.0.1:8283")
+
+
+async def external_memory(dot_id: str, variant: str, question: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """MEMORY.md as Mem0, Hindsight or Letta make it from the question's history, and the requests it cost."""
+    conversations = json.loads(await _engine_python(dot_id, CONVERSATIONS_JSON, "reading the conversations"))
+    request = {
+        "conversations": conversations,
+        "sessions": [
+            {"date": date, "turns": [{"role": t["role"], "content": t["content"]} for t in session]}
+            for date, session in zip(question["haystack_dates"], question["haystack_sessions"])
+        ],
+        "question": question["question"],
+        "question_date": question["question_date"],
+        "base_url": f"http://127.0.0.1:{METER_PORT}/q/{question['question_id']}/api/v1",
+        "api_key": Path(os.environ["E2E_OPENROUTER_KEY_FILE"]).read_text(encoding="utf-8").strip(),
+        "model": os.environ.get("BENCH_MODEL", "z-ai/glm-5.3-flash"),
+        "embedding_model": "openai/text-embedding-3-small",
+        "letta_url": LETTA_URL,
+    }
+    process = await asyncio.create_subprocess_exec(
+        f"/opt/mem-{variant}/bin/python",
+        str(Path(__file__).resolve().parent / f"memory_{variant}.py"),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await process.communicate(json.dumps(request).encode())
+    if process.returncode != 0:
+        raise RuntimeError(f"{variant} failed: {err.decode(errors='replace')[-1500:]}")
+    usages = [line for line in read_jsonl(METER_LOG) if line["question"] == question["question_id"]]
+    return json.loads(out)["memory_md"], usages
+
+
+async def profile(dot_id: str, variant: str, question: dict[str, Any]) -> dict[str, Any]:
     """MEMORY.md written from the conversations, outside the Dot with the Dot's model, then put in the Dot: by our one
     request (templates/agent/memory_update.md, "ours") or by an open-source method ported in memory_variants.py."""
     from openai import AsyncOpenAI
@@ -194,7 +233,9 @@ async def profile(dot_id: str, variant: str) -> dict[str, Any]:
         finishes.append(completion.choices[0].finish_reason)
         return (completion.choices[0].message.content or "").strip(), (completion.usage.model_dump() if completion.usage else {})
 
-    if variant == "ours":
+    if variant in EXTERNAL:
+        text, usages = await external_memory(dot_id, variant, question)
+    elif variant == "ours":
         prompt = await _engine_python(dot_id, PROFILE_PROMPT, "rendering the memory update")
         text, usage = await complete([{"role": "user", "content": prompt}])
         usages = [usage]
@@ -222,7 +263,7 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
     try:
         await give_history(dot_id, question, history)
         dreamt = await dream(dot_id) if with_dream else {}
-        profiled = await profile(dot_id, profile_variant) if profile_variant else {}
+        profiled = await profile(dot_id, profile_variant, question) if profile_variant else {}
         if with_dream:
             (out / "dream-events").mkdir(exist_ok=True)
             (out / "dream-events" / f"{question['question_id']}.json").write_text(
@@ -285,7 +326,18 @@ async def run(args: argparse.Namespace) -> None:
             append_jsonl(out / "hypotheses.jsonl", row)
             print(f"{row['question_id']} {row['status']} {row['seconds']}s ${row['spent_usd']}", flush=True)
 
-    await asyncio.gather(*(one(q) for q in todo))
+    meter = None
+    if args.profile in EXTERNAL:
+        meter = await asyncio.create_subprocess_exec(
+            sys.executable, str(Path(__file__).resolve().parent / "openrouter_meter.py"),
+            "--port", str(METER_PORT), "--log", str(METER_LOG),
+        )
+    try:
+        await asyncio.gather(*(one(q) for q in todo))
+    finally:
+        if meter is not None:
+            meter.terminate()
+            await meter.wait()
 
 
 def judge_prompt():
@@ -366,9 +418,10 @@ def main() -> None:
     )
     commands.choices["run"].add_argument(
         "--profile",
-        choices=["ours", "mastra", "langmem", "memobase"],
+        choices=["ours", "mastra", "langmem", "memobase", *EXTERNAL],
         help="MEMORY.md is written before the question: by our one request (templates/agent/memory_update.md) "
-        "or by an open-source method (memory_variants.py)",
+        "or by an open-source method (memory_variants.py; memory_<name>.py for Mem0, Hindsight and Letta, through "
+        "openrouter_meter.py)",
     )
     commands.choices["run"].add_argument("--questions", type=int, default=116)
     commands.choices["run"].add_argument("--kind", help="every question of this question_type instead of the subset")
