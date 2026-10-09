@@ -111,6 +111,44 @@ task, `-i`/`-x` to include or exclude tasks. Results go to `BENCH_JOBS_DIR`
 | `BENCH_MAX_STEPS` | 150 | the Dot's `limits.max_steps_per_task` |
 | `BENCH_MAX_COST_USD` | 3 | the Dot's `limits.max_cost_per_task_usd` |
 
+## LongMemEval: does a Dot remember?
+
+`longmemeval.py` runs [LongMemEval](https://github.com/xiaowu0162/LongMemEval)
+(MIT; ICLR 2025): each question has a history of about 48 dated chats (115K
+tokens) and asks what only that history answers. Each question gets a new Dot:
+the history becomes its conversation files, as the engine writes them; the Dot
+makes its own memory pass over them; the question is a task; LongMemEval's own
+prompts grade the answer with GPT-4o, outside the Dot. Questions: a fixed
+subset of 116 in the benchmark's proportions, or every one of a kind (`--kind`).
+
+```bash
+docker exec -w /work/dots -e E2E_OPENROUTER_KEY_FILE=/run/secrets/openrouter idots-bench \
+  bash tests/bench/run.sh longmemeval run --data /data-lme/longmemeval_s_cleaned.json --out /work/bench-jobs/lme -n 6
+docker exec -w /work/dots -e E2E_OPENROUTER_KEY_FILE=/run/secrets/openrouter idots-bench \
+  python3 tests/bench/longmemeval.py judge --data /data-lme/longmemeval_s_cleaned.json --out /work/bench-jobs/lme
+```
+
+Measured with z-ai/glm-5.3-flash (October 2026), 116 questions: 7.8% with no
+history (the control, `--history none`), 82.8% with the conversation files, 88%
+after the token and prompt fixes that run found, 90.5% with MEMORY.md written
+by the memory pass (updates 78 to 94%, preferences 57 to 71%).
+
+How MEMORY.md is written was chosen on the 30 preference questions, the same
+for every method:
+
+| Method | Correct | Cost of a pass over 115K tokens |
+|---|---|---|
+| no MEMORY.md (the Dot searches the files) | 39/60, 65% | 0 |
+| **one request (the memory pass)** | **50/60, 83%** | **~$0.015, 1 call** |
+| Hindsight (MIT), recall for the question | 25/30, 83% | ~$0.25, ~255 calls, Postgres |
+| Mastra Observational Memory (Apache-2.0) | 48/60, 80% | ~$0.05, ~6 calls |
+| LangMem profile manager (MIT) | 48/60, 80% | ~$0.02, 1 call |
+| an agent pass with file tools (upstream nanobot's Dream) | 44/59, 75% | ~$0.08 |
+
+Mem0, Letta and Memobase were not run to the end: by their own call patterns a
+pass would cost $0.25 to $1.60. The adapters of that study (their prompts
+ported; Mem0, Hindsight and Letta in their own venvs) are in commit `de3d9a1b`.
+
 ## External benchmarks
 
 Harbor's registry datasets run the same way, for instance Terminal-Bench 2.0

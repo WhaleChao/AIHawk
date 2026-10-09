@@ -18,7 +18,9 @@ fixed subset of 116, proportional to the benchmark's six kinds of question (`--q
 
 --history conversations (the default): the sessions become the Dot's chat files, by day, in
 /home/dot/conversations, written by the engine's own code in the Dot (nanobot/dots/conversations.py), as if
-the person had had those conversations with it.
+the person had had those conversations with it. The question waits for the Dot's own memory pass over them
+(nanobot/dots/memory_update.py), which comes once the Dot has been quiet for 5 minutes, so it is answered with
+the MEMORY.md a Dot would have.
 
 --history none: nothing of the history reaches the Dot. It is the control, what a Dot that keeps nothing
 of its past conversations scores: about the share of questions whose right answer is "not known".
@@ -130,180 +132,44 @@ async def give_history(dot_id: str, question: dict[str, Any], history: str) -> N
         raise RuntimeError(f"writing the history failed: {result['stderr'][-1500:]}")
 
 
-# Run by the engine's own Python in the Dot: the prompt the Dot's memory pass works from (templates/agent/dream.md),
-# over every conversation file.
-DREAM_PROMPT = """
-import pathlib
-from nanobot.dots.conversations import CONVERSATIONS_DIR
-from nanobot.dots.skills import DOT_SKILLS_DIR
-from nanobot.dots.turns import MEMORY_DIR
-from nanobot.utils.prompt_templates import render_template
-files = sorted(str(path) for path in pathlib.Path(CONVERSATIONS_DIR).rglob("*.md"))
-print(render_template("agent/dream.md", conversations=files, memory_dir=MEMORY_DIR, dot_skills_dir=DOT_SKILLS_DIR))
-"""
+# How long a Dot given a history may take to bring its MEMORY.md up to date from it: the engine waits for 5
+# quiet minutes after its start (nanobot/dots/memory_update.py), then makes the pass.
+MEMORY_WAIT_S = 20 * 60
 
 
-async def dream(dot_id: str) -> dict[str, Any]:
-    """The memory pass over the history, as a task before the question."""
-    rendered = await call(
-        "exec", dot_id, "120000", stdin=f"/opt/invisible-dots-engine/bin/python -I -B - <<'PY'\n{DREAM_PROMPT}\nPY\n".encode()
-    )
-    if rendered["exit_code"] != 0:
-        raise RuntimeError(f"rendering the memory pass failed: {rendered['stderr'][-1500:]}")
-    return await call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=rendered["stdout"].encode())
+async def memory_pass(dot_id: str) -> dict[str, Any]:
+    """Wait for the Dot's own memory pass over the history (its `memory.updated`) and return what it reported."""
+    deadline = time.monotonic() + MEMORY_WAIT_S
+    while time.monotonic() < deadline:
+        updated = [e["data"] for e in await call("events", dot_id) if e["type"] == "memory.updated"]
+        if updated:
+            return updated[-1]
+        await asyncio.sleep(15)
+    raise TimeoutError(f"the Dot made no memory pass within {MEMORY_WAIT_S} s")
 
 
-# Run by the engine's own Python in the Dot: the one request that writes MEMORY.md from the conversations
-# (templates/agent/memory_update.md).
-PROFILE_PROMPT = """
-import pathlib
-from nanobot.dots.conversations import CONVERSATIONS_DIR
-from nanobot.dots.turns import MEMORY_DIR, MEMORY_INDEX
-from nanobot.utils.prompt_templates import render_template
-memory = pathlib.Path(MEMORY_DIR, MEMORY_INDEX)
-files = sorted(pathlib.Path(CONVERSATIONS_DIR).rglob("*.md"))
-print(render_template(
-    "agent/memory_update.md",
-    memory_md=memory.read_text(encoding="utf-8") if memory.exists() else "",
-    conversations=[{"path": str(f), "text": f.read_text(encoding="utf-8")} for f in files],
-))
-"""
-
-
-# Run by the engine's own Python in the Dot: the conversation files, oldest first, as JSON.
-CONVERSATIONS_JSON = """
-import json, pathlib
-from nanobot.dots.conversations import CONVERSATIONS_DIR
-files = sorted(pathlib.Path(CONVERSATIONS_DIR).rglob("*.md"))
-print(json.dumps([{"path": str(f), "text": f.read_text(encoding="utf-8")} for f in files]))
-"""
-
-
-async def _engine_python(dot_id: str, script: str, what: str) -> str:
-    result = await call(
-        "exec", dot_id, "120000", stdin=f"/opt/invisible-dots-engine/bin/python -I -B - <<'PY'\n{script}\nPY\n".encode()
-    )
-    if result["exit_code"] != 0:
-        raise RuntimeError(f"{what} failed: {result['stderr'][-1500:]}")
-    return result["stdout"]
-
-
-# Memory systems that run as their own programs, each in its venv in the bench container (memory_<name>.py), calling
-# the model through the metering proxy (openrouter_meter.py), which records what each question cost.
-EXTERNAL = ("mem0", "hindsight", "letta")
-METER_PORT = 8790
-METER_LOG = Path(os.environ.get("BENCH_METER_LOG", "/work/bench-jobs/meter.jsonl"))
-LETTA_URL = os.environ.get("BENCH_LETTA_URL", "http://127.0.0.1:8283")
-
-
-async def external_memory(dot_id: str, variant: str, question: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    """MEMORY.md as Mem0, Hindsight or Letta make it from the question's history, and the requests it cost."""
-    conversations = json.loads(await _engine_python(dot_id, CONVERSATIONS_JSON, "reading the conversations"))
-    request = {
-        "conversations": conversations,
-        "sessions": [
-            {"date": date, "turns": [{"role": t["role"], "content": t["content"]} for t in session]}
-            for date, session in zip(question["haystack_dates"], question["haystack_sessions"])
-        ],
-        "question": question["question"],
-        "question_date": question["question_date"],
-        "base_url": f"http://127.0.0.1:{METER_PORT}/q/{question['question_id']}/api/v1",
-        "api_key": Path(os.environ["E2E_OPENROUTER_KEY_FILE"]).read_text(encoding="utf-8").strip(),
-        "model": os.environ.get("BENCH_MODEL", "z-ai/glm-5.3-flash"),
-        "embedding_model": "openai/text-embedding-3-small",
-        "letta_url": LETTA_URL,
-        "question_id": question["question_id"],
-        # Mem0 per session rather than per pair (its own runner's choice), at about a fifth of the calls.
-        "add_per": "session",
-        # What Hindsight recalls, kept within the 25,000 characters a Dot carries of MEMORY.md (its benchmark asks
-        # for 32768 + 16384 tokens): its own ranking chooses, not a cut.
-        "recall_max_tokens": 4000,
-        "chunk_max_tokens": 2000,
-    }
-    process = await asyncio.create_subprocess_exec(
-        f"/opt/mem-{variant}/bin/python",
-        str(Path(__file__).resolve().parent / f"memory_{variant}.py"),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out, err = await process.communicate(json.dumps(request).encode())
-    if process.returncode != 0:
-        raise RuntimeError(f"{variant} failed: {err.decode(errors='replace')[-1500:]}")
-    usages = [line for line in read_jsonl(METER_LOG) if line["question"] == question["question_id"]]
-    return json.loads(out)["memory_md"], usages
-
-
-async def profile(dot_id: str, variant: str, question: dict[str, Any]) -> dict[str, Any]:
-    """MEMORY.md written from the conversations, outside the Dot with the Dot's model, then put in the Dot: by our one
-    request (templates/agent/memory_update.md, "ours") or by an open-source method ported in memory_variants.py."""
-    from openai import AsyncOpenAI
-
-    key = Path(os.environ["E2E_OPENROUTER_KEY_FILE"]).read_text(encoding="utf-8").strip()
-    client = AsyncOpenAI(api_key=key, base_url="https://openrouter.ai/api/v1")
-    finishes: list[str | None] = []
-
-    async def complete(messages: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
-        completion = await client.chat.completions.create(
-            model=os.environ.get("BENCH_MODEL", "z-ai/glm-5.3-flash"),
-            messages=messages,
-            extra_body={"usage": {"include": True}},
-        )
-        finishes.append(completion.choices[0].finish_reason)
-        return (completion.choices[0].message.content or "").strip(), (completion.usage.model_dump() if completion.usage else {})
-
-    if variant in EXTERNAL:
-        text, usages = await external_memory(dot_id, variant, question)
-    elif variant == "ours":
-        prompt = await _engine_python(dot_id, PROFILE_PROMPT, "rendering the memory update")
-        text, usage = await complete([{"role": "user", "content": prompt}])
-        usages = [usage]
-    else:
-        import memory_variants
-
-        conversations = json.loads(await _engine_python(dot_id, CONVERSATIONS_JSON, "reading the conversations"))
-        text, usages = await memory_variants.write_memory(variant, conversations, "", complete)
-    await call("put", dot_id, "/home/dot/memory/MEMORY.md", stdin=(text + "\n").encode())
-    return {
-        "profile_variant": variant,
-        "profile_calls": len(usages),
-        "profile_spent_usd": sum(u.get("cost") or 0 for u in usages),
-        "profile_prompt_tokens": sum(u.get("prompt_tokens") or 0 for u in usages),
-        "profile_answer_tokens": sum(u.get("completion_tokens") or 0 for u in usages),
-        "profile_finish": sorted({str(f) for f in finishes}),
-    }
-
-
-async def answer(question: dict[str, Any], history: str, out: Path, with_dream: bool, profile_variant: str | None) -> dict[str, Any]:
+async def answer(question: dict[str, Any], history: str, out: Path) -> dict[str, Any]:
     name = f"bench-lme-{hashlib.sha256(question['question_id'].encode()).hexdigest()[:10]}"
     started = time.monotonic()
     created = await call("create", name, stdin=dot_yaml(name, cpus=2, memory_gb=4).encode())
     dot_id = created["id"]
     try:
         await give_history(dot_id, question, history)
-        dreamt = await dream(dot_id) if with_dream else {}
-        profiled = await profile(dot_id, profile_variant, question) if profile_variant else {}
-        if with_dream:
-            (out / "dream-events").mkdir(exist_ok=True)
-            (out / "dream-events" / f"{question['question_id']}.json").write_text(
-                json.dumps(await call("events", dot_id, dreamt["id"]), indent=1), encoding="utf-8"
-            )
+        memory = await memory_pass(dot_id) if history != "none" else {}
         task = await call("task", dot_id, str(TASK_TIMEOUT_MS), stdin=task_text(question).encode())
         events = await call("events", dot_id, task["id"])
         (out / "events").mkdir(exist_ok=True)
         (out / "events" / f"{question['question_id']}.json").write_text(json.dumps(events, indent=1), encoding="utf-8")
-        # The engine's own log goes with the Dot: kept for every question, since a wrong answer is known only
-        # once judged.
+        # The engine's own log and the MEMORY.md the question was answered with go with the Dot: kept for every
+        # question, since a wrong answer is known only once judged.
         journal = await call(
             "exec", dot_id, "60000", stdin=b"journalctl -u invisible-dots-agent --no-pager -o cat | tail -n 3000"
         )
         (out / "engine").mkdir(exist_ok=True)
         (out / "engine" / f"{question['question_id']}.log").write_text(journal["stdout"] or journal["stderr"], encoding="utf-8")
-        if with_dream or profile_variant:
-            # What the memory pass left the question to work from.
-            memory = await call("exec", dot_id, "60000", stdin=b"cat /home/dot/memory/MEMORY.md")
-            (out / "memory").mkdir(exist_ok=True)
-            (out / "memory" / f"{question['question_id']}.md").write_text(memory["stdout"], encoding="utf-8")
+        memory_md = await call("exec", dot_id, "60000", stdin=b"cat /home/dot/memory/MEMORY.md 2>/dev/null")
+        (out / "memory").mkdir(exist_ok=True)
+        (out / "memory" / f"{question['question_id']}.md").write_text(memory_md["stdout"], encoding="utf-8")
     finally:
         await call("delete", dot_id)
     return {
@@ -312,13 +178,8 @@ async def answer(question: dict[str, Any], history: str, out: Path, with_dream: 
         "status": task.get("status"),
         "error": task.get("error"),
         "spent_usd": task.get("spent_usd"),
+        "memory_spent_usd": memory.get("spent_usd"),
         "seconds": round(time.monotonic() - started),
-        **(
-            {"dream_status": dreamt.get("status"), "dream_error": dreamt.get("error"), "dream_spent_usd": dreamt.get("spent_usd")}
-            if with_dream
-            else {}
-        ),
-        **profiled,
     }
 
 
@@ -340,25 +201,14 @@ async def run(args: argparse.Namespace) -> None:
     async def one(question: dict[str, Any]) -> None:
         async with gate:
             try:
-                row = await answer(question, args.history, out, args.dream, args.profile)
+                row = await answer(question, args.history, out)
             except Exception as error:  # a question the product could not run is reported, not graded
                 print(f"{question['question_id']}: {error}", file=sys.stderr, flush=True)
                 return
             append_jsonl(out / "hypotheses.jsonl", row)
             print(f"{row['question_id']} {row['status']} {row['seconds']}s ${row['spent_usd']}", flush=True)
 
-    meter = None
-    if args.profile in EXTERNAL:
-        meter = await asyncio.create_subprocess_exec(
-            sys.executable, str(Path(__file__).resolve().parent / "openrouter_meter.py"),
-            "--port", str(METER_PORT), "--log", str(METER_LOG),
-        )
-    try:
-        await asyncio.gather(*(one(q) for q in todo))
-    finally:
-        if meter is not None:
-            meter.terminate()
-            await meter.wait()
+    await asyncio.gather(*(one(q) for q in todo))
 
 
 def judge_prompt():
@@ -434,16 +284,6 @@ def main() -> None:
         sub.add_argument("--data", required=True)
         sub.add_argument("--out", required=True)
     commands.choices["run"].add_argument("--history", default="conversations", choices=["conversations", "none"])
-    commands.choices["run"].add_argument(
-        "--dream", action="store_true", help="the memory pass (templates/agent/dream.md) runs as a task before the question"
-    )
-    commands.choices["run"].add_argument(
-        "--profile",
-        choices=["ours", "mastra", "langmem", "memobase", *EXTERNAL],
-        help="MEMORY.md is written before the question: by our one request (templates/agent/memory_update.md) "
-        "or by an open-source method (memory_variants.py; memory_<name>.py for Mem0, Hindsight and Letta, through "
-        "openrouter_meter.py)",
-    )
     commands.choices["run"].add_argument("--questions", type=int, default=116)
     commands.choices["run"].add_argument("--kind", help="every question of this question_type instead of the subset")
     commands.choices["run"].add_argument("--limit", type=int, help="only the first N of the questions (a pilot)")
