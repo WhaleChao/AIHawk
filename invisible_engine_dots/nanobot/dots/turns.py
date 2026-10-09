@@ -301,11 +301,11 @@ class TurnRunner:
         )
         provider = spend.meter(self._providers.current(settings, self._key_holder.require()))
         # Every request uses the whole of what its model can do: its own context window and longest answer.
-        runtime = LLMRuntime.at_model_limits(provider, settings.model_id, await _limits_of(provider, settings.model_id))
+        runtime = LLMRuntime.at_model_limits(provider, settings.model_id, await limits_of(provider, settings.model_id))
         # The summary of an outgrown thread may be written by another model (the `summary` role), through
         # the same metered provider, so its cost counts; it works within its own limits.
         summary_model = settings.model_for("summary")
-        summary_runtime = LLMRuntime.at_model_limits(provider, summary_model, await _limits_of(provider, summary_model))
+        summary_runtime = LLMRuntime.at_model_limits(provider, summary_model, await limits_of(provider, summary_model))
         tools = self._base_registry.view(settings.offered_tools)
         # What the tools of this turn returned for the model to look at, and the transcript does not keep.
         images = TurnImages()
@@ -473,7 +473,7 @@ class TurnRunner:
         return [entry.name for entry in notes[:MEMORY_NOTES_LISTED]]
 
 
-async def _limits_of(provider: Any, model: str) -> ModelLimits:
+async def limits_of(provider: Any, model: str) -> ModelLimits:
     """The limits OpenRouter publishes for `model`; a turn cannot run without them."""
     try:
         return cast(ModelLimits, await provider.model_limits(model))

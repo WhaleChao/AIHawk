@@ -59,6 +59,7 @@ class EngineHarness:
         key: bool = True,
         stop_grace_s: float = 0.05,
         browser: dict[str, Any] | None = None,
+        memory_quiet_s: float | None = None,
     ) -> None:
         self.tmp_path = tmp_path
         self.store = store
@@ -71,6 +72,8 @@ class EngineHarness:
         workspace.mkdir(parents=True, exist_ok=True)
         self.computer = LocalComputer(tmp_path, workspace)
         self.stop_grace_s = stop_grace_s
+        # None keeps the engine's own quiet spell before a memory pass, longer than any test waits.
+        self.memory_quiet_s = memory_quiet_s
         self.browser_options = browser or {}
         self.engines: list[Engine] = []
         self.cron = CronService(tmp_path / "cron" / "jobs.json")
@@ -97,6 +100,7 @@ class EngineHarness:
             key_holder=self.keys,
             workspace=self.computer.workspace,
             stop_grace_s=self.stop_grace_s,
+            **({} if self.memory_quiet_s is None else {"memory_quiet_s": self.memory_quiet_s}),
         )
         self.engines.append(engine)
         return engine

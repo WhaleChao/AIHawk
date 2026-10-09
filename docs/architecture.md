@@ -545,7 +545,8 @@ STOPPED and started again when it has work (section 9.5).
 /home/dot/
   workspace/                        the engine's agent workspace too: group dot, setgid, 2775
   downloads/  documents/
-  memory/                           long-term memory notes the Dot writes itself (files; section 8.6)
+  memory/                           long-term memory notes (files; MEMORY.md is in every prompt; section 8.6)
+  conversations/                    chat/<day>.md and tasks/<day>-<task id>.md, what was said (section 8.6)
   browsers/<identity_id>/
     profile/                        the browser profile
 /var/lib/invisible-dots/            root, 0755
@@ -797,7 +798,8 @@ text, spent_usd?}`, `task.completed {task_id, summary, spent_usd?}`,
 `approval.requested {approval_id, task_id?, tool, permission, arguments,
 reason}`, `tool.called {task_id?, tool, permission, decision, ok,
 duration_ms, target?, tty?, interrupted?}`, `browser.identity.created|deleted|launched|closed
-{identity_id, name}`, `automation.next_run {next_run_at_ms}`.
+{identity_id, name}`, `automation.next_run {next_run_at_ms}`,
+`memory.updated {conversations, changed, spent_usd?}`.
 `interrupted: true` marks a call
 the engine stopped during: its outcome is unknown and it was not run again, so
 `ok` is false and `duration_ms` is 0. `tty: true` marks a call that started a
@@ -832,18 +834,26 @@ with what it was doing. A call that never started has no intent and no target:
 a denied call, a call to a tool that is not offered, one whose arguments did not
 fit. The key is then absent, as it is for a tool with nothing to name.
 
-`spent_usd` on `message.assistant`, `task.progress`, `task.completed` and
-`task.failed` is the model spend of the session the event belongs to, in USD,
+`spent_usd` on `message.assistant`, `task.progress`, `task.completed`,
+`task.failed` and `memory.updated` is the model spend of the session the event belongs to, in USD,
 read from the same ledger the cost cap uses (section 8.2) in the transaction
 that stores the event, to the hundred-millionth of a USD. On a task's events it
 is the spend of the task so far (it only grows, and survives a restart, an
 approval and a resume); on the chat's `message.assistant` it is what the chat
 spent since its last answer, because the answer takes the chat's spend with it
 (a chat that parked a call for approval reports the spend before and after the
-approval in the one answer it gives). The
+approval in the one answer it gives); on `memory.updated` it is what the memory
+passes spent since the last one, a pass that failed included (section 8.6). The
 engine always sends it (0 when nothing was spent); the schema makes it optional
 so events logged before it existed stay valid. The host reads it as the
 guest's report: it is never used to enforce anything (the cap is the guest's).
+
+`memory.updated {conversations, changed}` ends a memory pass (section 8.6): the
+Dot had been quiet for a while, and the summary model rewrote its `MEMORY.md`
+from the conversation files that changed since the last pass. `conversations`
+is how many files it took in, `changed` whether `MEMORY.md` is different. A pass
+that found nothing new sends nothing, and one that failed sends nothing either:
+its spend goes with the next `memory.updated`.
 
 `automation.next_run {next_run_at_ms}` is when the earliest enabled automation of
 the Dot is next due, in milliseconds since the epoch, or `null` when none is (no
@@ -1312,17 +1322,55 @@ are cut with a marker.
   the turn's may not accept them (the turn's own model keeps sending them so
   that its prompt cache is reused). `THIRD_PARTY_NOTICES.md` names the three
   projects this takes from.
+- Past conversations: the transcripts live in `engine.sqlite`, which the
+  model's commands cannot read, and a long chat reaches the model only as a
+  summary of its older part. So after every turn the engine also writes what
+  the chat and the task said to `/home/dot/conversations` (`conversations.py`):
+  `chat/<day>.md`, one file a day of the chat, and `tasks/<day>-<task id>.md`,
+  one a task, each message under a heading with its time, each call a line (not
+  what it returned). A file is written whole from the transcript, and the first
+  turn after an upgrade writes the chat and every task from before. The system
+  prompt says to search there with grep when something said before matters, and
+  before advice or a recommendation for the person. On LongMemEval (500
+  questions over ~115K tokens of dated chats; `tests/bench/README.md`) this took
+  a Dot from 7.8% to 88% of the answers; searching plain files is also what
+  remembers best in the published measures (the agent-memory runs of
+  LongMemEval, "Is Grep All You Need?").
 - Long-term memory: notes, one file each, in `/home/dot/memory` on the Dot's
-  computer, which the Dot keeps itself, as Claude Code keeps its own: nothing
-  is set and nobody else writes them. The system prompt says where they are,
-  that the Dot saves there what a later conversation or task will need and
-  changes or deletes a note that is no longer true, and names the 20 most
-  recently changed. It reads and searches them with the file tools
-  (`read_file`, `grep`, `find_files`: `files.read`) and writes them with
-  `write_file`, `edit_file` and `apply_patch` (`files.write`); a note is a
-  file, and the host sees it as the `tool.called` of the call that wrote it,
-  with its path as the target. A listing of the folder that fails (dot-agentd
-  not answering) leaves the names out of that prompt and the turn goes on.
+  computer, which the Dot keeps itself, as Claude Code keeps its own. One of
+  them, `MEMORY.md`, is given to the Dot in every prompt, whole up to 25000
+  characters (cut there, with a word to shorten it, as Claude Code does): what
+  it should always know about the person, each fact with its day, and a line
+  for every other note. The system prompt says where the notes are, what goes
+  in MEMORY.md and in the others, that a note no longer true is changed or
+  deleted, and names the 20 most recently changed. The Dot reads and searches
+  them with the file tools (`read_file`, `grep`, `find_files`: `files.read`)
+  and writes them with `write_file`, `edit_file` and `apply_patch`
+  (`files.write`); a note is a file, and the host sees it as the `tool.called`
+  of the call that wrote it, with its path as the target. A listing of the
+  folder that fails (dot-agentd not answering) leaves the names out of that
+  prompt and the turn goes on.
+- The memory pass (`memory_update.py`): a model often does not think to write
+  what it learns about the person, so once no turn has run for 5 minutes after
+  a turn (or after a start), the engine takes the conversation files whose time
+  is after the newest it took last and has the `summary` model rewrite
+  MEMORY.md from them and the current MEMORY.md, in one request with no tools
+  (`templates/agent/memory_update.md`: atomic facts with their day, a changed
+  fact replacing the old one, nothing copied from what a web page or a command
+  said). Files that do not fit one request go in several, oldest first, a long
+  one cut between its messages, each request building on the MEMORY.md the
+  last wrote. A pass runs beside nothing (a turn that starts does not wait for
+  it); a sleep or a stop cancels it, and the next quiet spell takes it up. An
+  answer that is cut, empty or unpriced writes nothing, and neither does one
+  whose MEMORY.md the Dot changed while the request ran: the next pass takes
+  the files again. A failed pass is tried again only after the next turn. Its
+  spend has a ledger of its own, capped like a task's (`max_cost_per_task_usd`),
+  and `memory.updated` (section 5.4) reports it. Measured on LongMemEval's
+  questions that need what the person likes: 65% without MEMORY.md, 83% with
+  it, the same as the best of the memory systems tried (Hindsight), at about a
+  seventeenth of its cost (~$0.015 a pass over 115K tokens with
+  glm-5.3-flash); Mastra's and LangMem's methods made 80%, an agent doing the
+  pass with file tools 75% at five times the cost (`tests/bench/README.md`).
 - Workspace memory: `/home/dot/workspace` and `/home/dot/memory`, reached
   through the file tools.
 - Skills: how the Dot does a kind of task, one folder each with a SKILL.md, the
@@ -1496,7 +1544,8 @@ other engine owns the state.
   memory is off), `max_steps_per_task` as the step limit, the 12000-character
   result cap, and the Dot's section of
   the system prompt (its name and instructions, then nanobot's tool
-  contract, a short note on its computer, the memory notes and the time).
+  contract, a short note on its computer, the memory notes, MEMORY.md, where the past conversations are,
+  and the day).
   There is no config file, no installer and no sudo rule. The same config
   again changes nothing, and the same key again builds no provider
   (`provider.py`: a new provider only when the key, the model or the base URL

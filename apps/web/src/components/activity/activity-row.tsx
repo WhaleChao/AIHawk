@@ -1,6 +1,6 @@
 "use client";
 
-import { CircleDotIcon, FlagIcon, GlobeIcon, HandIcon, MessageSquareIcon, MonitorIcon, SendIcon, SparklesIcon, type LucideIcon } from "lucide-react";
+import { BrainIcon, CircleDotIcon, FlagIcon, GlobeIcon, HandIcon, MessageSquareIcon, MonitorIcon, SendIcon, SparklesIcon, type LucideIcon } from "lucide-react";
 import { toolLabel } from "../../lib/events/tool-labels";
 import type { EventFamily, EventView } from "../../lib/events/view";
 import { formatDate } from "../../lib/format";
@@ -16,6 +16,7 @@ const ICON: Record<EventFamily, LucideIcon> = {
   // A tool call draws the icon of its own kind of tool; this one is for a call with no tool named.
   tools: CircleDotIcon,
   approvals: HandIcon,
+  memory: BrainIcon,
   browser: GlobeIcon,
   computer: MonitorIcon,
   channels: SendIcon,

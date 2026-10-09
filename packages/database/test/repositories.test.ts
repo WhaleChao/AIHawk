@@ -410,22 +410,23 @@ describe.each(testAdapters())("repositories on %s", { timeout: SETUP_TIMEOUT }, 
     await guest(dot.id, "task.completed", { task_id: "task_1", summary: "b", spent_usd: 0.2 });
     await guest(dot.id, "task.failed", { task_id: "task_2", error: "c", spent_usd: 0.5 });
     await guest(dot.id, "message.assistant", { text: "d", spent_usd: 0.25 });
+    await guest(dot.id, "memory.updated", { conversations: 3, changed: true, spent_usd: 0.0625 });
     // An event that predates the report has none, and a type that reports no spend adds none.
     await guest(dot.id, "message.assistant", { text: "old" });
     await guest(dot.id, "automation.next_run", { next_run_at_ms: null, spent_usd: 99 });
     // Another Dot's, and a host event of the same type, are not this Dot's.
     await guest(other.id, "task.completed", { task_id: "task_9", summary: "z", spent_usd: 7 });
     await db.events.insertHost(dot.id, "task.completed", { task_id: "task_h", spent_usd: 50 });
-    // 0.2 + 0.5 + 0.25: the float sum is rounded to the hundred-millionth of a USD, the engine's resolution.
-    expect(await db.events.spentUsd(dot.id)).toBe(0.95);
+    // 0.2 + 0.5 + 0.25 + 0.0625: the float sum is rounded to the hundred-millionth of a USD, the engine's resolution.
+    expect(await db.events.spentUsd(dot.id)).toBe(1.0125);
     expect(await db.events.spentUsd(other.id)).toBe(7);
 
     const later = new Date(Date.now() + 60_000);
     expect(await db.events.spentUsd(dot.id, later)).toBe(0);
-    expect(await db.events.spentUsd(dot.id, new Date(Date.now() - 60_000))).toBe(0.95);
+    expect(await db.events.spentUsd(dot.id, new Date(Date.now() - 60_000))).toBe(1.0125);
     await db.query("UPDATE events SET created_at = now() - interval '2 days' WHERE dot_id = $1 AND type = 'task.completed' AND source = 'guest'", [dot.id]);
-    expect(await db.events.spentUsd(dot.id, new Date(Date.now() - 3_600_000))).toBe(0.75);
-    expect(await db.events.spentUsd(dot.id)).toBe(0.95);
+    expect(await db.events.spentUsd(dot.id, new Date(Date.now() - 3_600_000))).toBe(0.8125);
+    expect(await db.events.spentUsd(dot.id)).toBe(1.0125);
   });
 
   it("events: a float sum shows no noise", async () => {

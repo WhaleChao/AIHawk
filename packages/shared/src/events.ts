@@ -45,6 +45,7 @@ export const OUTBOUND_EVENT_TYPES = [
   "tool.called",
   ...IDENTITY_EVENT_TYPES,
   "automation.next_run",
+  "memory.updated",
 ] as const;
 export type OutboundEventType = (typeof OUTBOUND_EVENT_TYPES)[number];
 
@@ -145,8 +146,8 @@ export interface ApprovalRequestedData {
 /**
  * Model spend in USD, on the events that report it (architecture section 5.4): what the
  * session of the event has spent so far. A task's events carry the task's spend (it only
- * grows), the chat's `message.assistant` the spend of the turn that answered. The engine
- * always sends it; it is optional because events logged before it existed have none.
+ * grows), the chat's `message.assistant` the spend of the turn that answered, a `memory.updated` the spend of the
+ * memory passes since the last one. The engine always sends it; it is optional because events logged before it existed have none.
  */
 export interface SpentUsd {
   spent_usd?: number;
@@ -157,7 +158,7 @@ export interface SpentUsd {
  * of it. `task.progress` also carries `spent_usd`, but it is a running value of a task that ends with
  * one of these, so summing it would count the same money twice.
  */
-export const USAGE_EVENT_TYPES = ["task.completed", "task.failed", "message.assistant"] as const satisfies readonly OutboundEventType[];
+export const USAGE_EVENT_TYPES = ["task.completed", "task.failed", "message.assistant", "memory.updated"] as const satisfies readonly OutboundEventType[];
 
 /** The longest `target` of a `tool.called` event, in characters: code points, which is how zod 4 measures a string (the engine's copy is in nanobot/dots/protocol.py). */
 export const TOOL_TARGET_MAX = 160;
@@ -215,6 +216,13 @@ export interface OutboundEventDataMap {
    * run the engine has not made yet: it makes it when it starts.
    */
   "automation.next_run": { next_run_at_ms: number | null };
+  /**
+   * The Dot brought its MEMORY.md (what it is given about the person in every prompt) up to date from the
+   * conversations that changed since the last time, once it had been quiet for a while (the engine's
+   * `memory_update.py`): how many conversation files it took in, whether MEMORY.md changed, and what the pass cost
+   * (with the cost of any pass that failed since the last of these).
+   */
+  "memory.updated": { conversations: number; changed: boolean } & SpentUsd;
 }
 
 /**
@@ -393,6 +401,11 @@ export const outboundEventSchema = z.discriminatedUnion("type", [
     ...outboundBase,
     type: z.literal("automation.next_run"),
     data: z.object({ next_run_at_ms: z.number().int().nonnegative().max(MAX_RUN_AT_MS).nullable() }),
+  }),
+  z.object({
+    ...outboundBase,
+    type: z.literal("memory.updated"),
+    data: z.object({ conversations: z.number().int().nonnegative(), changed: z.boolean(), spent_usd: spentUsd }),
   }),
 ]);
 

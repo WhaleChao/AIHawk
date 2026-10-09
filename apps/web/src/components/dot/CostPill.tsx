@@ -1,11 +1,11 @@
 "use client";
 
+import { USAGE_EVENT_TYPES } from "@invisible-dots/shared/browser";
 import { api } from "../../lib/api";
 import { formatUsd, startOfToday } from "../../lib/format";
 import { DotEventScope, useLiveRefresh } from "../events";
 import { useResource } from "../ui";
 
-const SPEND_EVENTS = ["message.assistant", "task.completed", "task.failed"];
 
 /**
  * What the Dot's model calls cost since midnight, as its guest reported them. It is scoped to its own Dot, so
@@ -22,7 +22,7 @@ export function CostPill({ dotId }: { dotId: string }) {
 function Spend({ dotId }: { dotId: string }) {
   const since = startOfToday();
   const usage = useResource(() => api.usage(dotId, { since }), `usage:${dotId}:${since}`);
-  useLiveRefresh(usage.reload, SPEND_EVENTS);
+  useLiveRefresh(usage.reload, USAGE_EVENT_TYPES);
   if (usage.data === undefined) return null;
   return (
     <span className="font-mono text-xs text-muted-foreground tabular-nums" title="Model spend today, as the Dot's computer reported it">

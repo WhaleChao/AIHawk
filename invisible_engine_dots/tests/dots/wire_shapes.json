@@ -163,6 +163,14 @@
         "next_run_at_ms": null
       },
       "type": "automation.next_run"
+    },
+    {
+      "data": {
+        "changed": true,
+        "conversations": 4,
+        "spent_usd": 0.0625
+      },
+      "type": "memory.updated"
     }
   ],
   "skills": [

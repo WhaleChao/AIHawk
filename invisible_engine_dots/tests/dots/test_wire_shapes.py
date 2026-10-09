@@ -81,6 +81,8 @@ async def _engine_events(make_engine: MakeEngine) -> list[dict[str, Any]]:
         # A chat turn and a task whose call asks for approval.
         calls(call("c5", "exec", command="ls -la")),
         calls(call("c6", "exec", command="ls -la")),
+        # The memory pass over the conversations above.
+        says("## The person\n- looks for the cheapest fares (2026-10-04)", cost=0.0625),
     ]
     h = make_engine(script)
     h.engine.start()
@@ -110,6 +112,8 @@ async def _engine_events(make_engine: MakeEngine) -> list[dict[str, Any]]:
 
     h.engine.automations_next_run(1_790_000_000_000)
     h.engine.automations_next_run(None)
+    # The pass the engine starts once the Dot has been quiet, run now.
+    assert (await h.engine._memory.run()).kind == "updated"
     return h.events()
 
 

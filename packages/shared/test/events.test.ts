@@ -34,9 +34,10 @@ describe("event type lists", () => {
 
   it("match section 5.4", () => {
     expect(INBOUND_EVENT_TYPES).toEqual(["user.message", "task.created", "approval.received", "system.event"]);
-    expect(OUTBOUND_EVENT_TYPES).toHaveLength(14);
+    expect(OUTBOUND_EVENT_TYPES).toHaveLength(15);
     expect(OUTBOUND_EVENT_TYPES).toContain("browser.identity.launched");
     expect(OUTBOUND_EVENT_TYPES).toContain("automation.next_run");
+    expect(OUTBOUND_EVENT_TYPES).toContain("memory.updated");
     expect(OUTBOUND_EVENT_TYPES).toContain("agent.started");
     expect(HOST_EVENT_TYPES).toContain("computer.state");
     expect(isInboundEventType("user.message")).toBe(true);
@@ -147,7 +148,7 @@ describe("spent_usd (section 5.4)", () => {
   });
 
   it("is summed over the events that end a unit of spend, never over the running value of a task", () => {
-    expect([...USAGE_EVENT_TYPES]).toEqual(["task.completed", "task.failed", "message.assistant"]);
+    expect([...USAGE_EVENT_TYPES]).toEqual(["task.completed", "task.failed", "message.assistant", "memory.updated"]);
     expect(USAGE_EVENT_TYPES.every((type) => isOutboundEventType(type))).toBe(true);
   });
 });
