@@ -1,5 +1,7 @@
 <div align="center">
 <picture>
+  <source media="(max-width: 374px) and (prefers-color-scheme: dark)" srcset="docs/images/hero-small-dark.gif">
+  <source media="(max-width: 374px)" srcset="docs/images/hero-small-light.gif">
   <source media="(max-width: 1239px) and (prefers-color-scheme: dark)" srcset="docs/images/hero-mobile-dark.gif">
   <source media="(max-width: 1239px)" srcset="docs/images/hero-mobile-light.gif">
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-dark.gif">
