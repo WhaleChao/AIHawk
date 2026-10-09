@@ -203,6 +203,10 @@ class MemoryUpdater:
             if response.finish_reason != "stop" or not text:
                 return PassOutcome("failed", f"the model's answer ended with {response.finish_reason!r} and {len(text)} characters")
             spend.ensure_priced()
+            # MEMORY.md is under /home/dot, which the host's file routes serve: a secret the model copied goes masked,
+            # as in the conversation files.
+            secrets = [*self._store.write(conversations.known_secrets), self._key_holder.require()]
+            text = conversations.redact(text, secrets)
             if await self._read_memory() != memory:
                 # The Dot wrote MEMORY.md while this request ran: its version stands, and the next pass takes these
                 # conversations in again.

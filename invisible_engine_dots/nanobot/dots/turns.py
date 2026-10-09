@@ -420,8 +420,11 @@ class TurnRunner:
         written by a later turn: the count of the chat's written messages moves only once all are.
         """
 
+        key = [self._key_holder.require()] if self._key_holder.configured else []
+
         def read(conn: sqlite3.Connection) -> tuple[dict[str, str], int]:
             written = dots_store.read_kv(conn, conversations.KV_CHAT_WRITTEN)
+            secrets = [*conversations.known_secrets(conn), *key]
             files: dict[str, str] = {}
             tasks = (
                 dots_store.list_tasks(conn)
@@ -430,13 +433,16 @@ class TurnRunner:
             )
             for task in tasks:
                 messages = dots_store.load_session(conn, task.session_key).messages
-                files.update(conversations.task_file(task.task_id, task.status, messages, target=tool_target))
+                files.update(
+                    conversations.task_file(task.task_id, task.status, messages, target=tool_target, secrets=secrets)
+                )
             chat = dots_store.load_session(conn, CHAT_SESSION_KEY).messages
             since = written or 0
-            files.update(conversations.chat_files(chat, since, target=tool_target))
+            files.update(conversations.chat_files(chat, since, target=tool_target, secrets=secrets))
             return files, len(chat)
 
-        files, chat_length = self._store.read(read)
+        # A write: the secrets the files must not hold are gathered for good as they are read.
+        files, chat_length = self._store.write(read)
         try:
             for path, text in files.items():
                 await self._computer.write_bytes(f"{conversations.CONVERSATIONS_DIR}/{path}", text.encode("utf-8"))

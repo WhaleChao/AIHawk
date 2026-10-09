@@ -947,7 +947,11 @@ class TestApprovals:
         assert text.endswith(f"it will run once: {json.dumps(arguments, separators=(',', ':'))}]")
         assert seen == ["granted"]
         assert h.approval(approval_id).status == "done"
-        assert h.messages()[0][METADATA_KEY] == {"dots_approval_id": approval_id}
+        # The decision's public line goes with it, for the conversation files: the call and its target, no arguments.
+        assert h.messages()[0][METADATA_KEY] == {
+            "dots_approval_id": approval_id,
+            "dots_approval_line": 'The person approved the exec call (rm -rf build). The user\'s note: "go".',
+        }
 
     async def test_the_continuation_texts_are_the_contract_the_model_reads(self, make_engine: MakeEngine) -> None:
         h = make_engine()

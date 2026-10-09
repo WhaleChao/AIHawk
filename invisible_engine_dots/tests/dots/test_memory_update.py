@@ -212,6 +212,17 @@ class TestAPass:
         again = p.provider.requests[2]["messages"][0]["content"]
         assert "fact number 0 " in again
 
+    async def test_a_secret_the_model_copies_into_memory_md_is_masked(self, make_pass) -> None:
+        proxy = "http://shopper:Pw7c1dSecret@10.0.0.5:8099"
+        p = make_pass([says(f"{PROFILE}\n- shops through the proxy {proxy} (2023-05-20)")])
+        p.store.write(lambda conn: s.insert_identity(conn, identity_id="id1", name="shopping", proxy=proxy))
+        p.conversation("2023-05-20.md", DAY)
+
+        assert await p.updater.run() == m.PassOutcome("updated")
+
+        memory = p.memory() or ""
+        assert "shops through the proxy *** (2023-05-20)" in memory and "Pw7c1dSecret" not in memory
+
     async def test_a_window_too_small_for_memory_md_fails_without_asking(self, make_pass) -> None:
         p = make_pass([])
         p.provider.default_limits = replace(p.provider.default_limits, context_tokens=6_000, answer_tokens=1000)

@@ -1329,7 +1329,16 @@ are cut with a marker.
   `chat/<day>.md`, one file a day of the chat, and `tasks/<day>-<task id>.md`,
   one a task, each message under a heading with its time, each call a line (not
   what it returned). A file is written whole from the transcript, and the first
-  turn after an upgrade writes the chat and every task from before. The system
+  turn after an upgrade writes the chat and every task from before. The files
+  are under `/home/dot`, which the host's file routes serve, so nothing a
+  transcript holds that the events mask reaches them: a decision on a call is
+  written as its public line (the call and its target, never the arguments the
+  continuation hands the model), and every secret the engine knows is masked
+  as `***` in whatever text carries it, the person's and the model's included:
+  the proxies of the browser identities, gathered in `dots_kv` as they appear
+  and never forgotten (a file is written again whole, after an identity may
+  be gone), and the OpenRouter key, from the holder's memory only. The memory
+  pass masks them in `MEMORY.md` the same way. The system
   prompt says to search there with grep when something said before matters, and
   before advice or a recommendation for the person. On LongMemEval (500
   questions over ~115K tokens of dated chats; `tests/bench/README.md`) this took

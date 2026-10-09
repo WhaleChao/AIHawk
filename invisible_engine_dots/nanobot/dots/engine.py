@@ -50,7 +50,7 @@ from nanobot.dots.browser import CLOSE_TIMEOUT_S, BrowserManager
 from nanobot.dots.computer import Computer
 from nanobot.dots.gate import DotsGate, close_open_calls
 from nanobot.dots.memory_update import QUIET_S, MemoryUpdater
-from nanobot.dots.permissions import tool_table
+from nanobot.dots.permissions import tool_table, tool_target
 from nanobot.dots.projection import EngineSettings, project
 from nanobot.dots.protocol import (
     TASK_CANCELLED_EVENT,
@@ -73,7 +73,7 @@ from nanobot.dots.store import (
     InboundRow,
     ToolIntent,
 )
-from nanobot.dots.transcript_outbox import APPROVAL_ID, INBOUND_ID
+from nanobot.dots.transcript_outbox import APPROVAL_ID, APPROVAL_LINE, INBOUND_ID
 from nanobot.dots.turns import OpeningMessage, TurnOutcome, TurnRunner, TurnUnit
 
 # How many times a task may be started before an interruption fails it (architecture 8.7).
@@ -128,6 +128,14 @@ class _Turn:
 
 def _with_note(approval: Approval) -> str:
     return f' The user\'s note: "{approval.note}".' if approval.note else ""
+
+
+def approval_line(approval: Approval, approved: bool) -> str:
+    """What the Dot's conversation files say of a decision: the call and what it acted on (a target never shows a
+    secret), never the arguments the continuation hands the model."""
+    target = tool_target(approval.tool, approval.arguments)
+    call = f"the {approval.tool} call" + (f" ({target})" if target else "")
+    return f"The person {'approved' if approved else 'rejected'} {call}.{_with_note(approval)}"
 
 
 def approval_granted_continuation(approval: Approval) -> str:
@@ -633,7 +641,7 @@ class Engine:
         approved = source == "approved"
         telling = "granted" if approved else "told"
         text = approval_granted_continuation(approval) if approved else approval_rejected_continuation(approval)
-        opening = (OpeningMessage(text, {APPROVAL_ID: approval_id}),)
+        opening = (OpeningMessage(text, {APPROVAL_ID: approval_id, APPROVAL_LINE: approval_line(approval, approved)}),)
         if approval.session_key == CHAT_SESSION_KEY:
             if "chat" in self._turns:
                 # Its end kicks again.

@@ -49,6 +49,9 @@ from nanobot.dots.permissions import tool_permission
 INBOUND_ID = "dots_inbound_id"
 # user message: the id of the approval whose decision it tells the session.
 APPROVAL_ID = "dots_approval_id"
+# user message: what the Dot's conversation files say of that decision (the call and what it acted on, never its
+# arguments, which may hold a secret the events mask).
+APPROVAL_LINE = "dots_approval_line"
 # tool result the engine wrote itself to close a call that has no result of its own.
 CLOSED = "dots_closed"
 CLOSED_INTERRUPTED = "interrupted"

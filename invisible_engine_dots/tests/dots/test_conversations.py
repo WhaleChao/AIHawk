@@ -15,7 +15,7 @@ from nanobot.agent.transcript_metadata import METADATA_KEY
 from nanobot.dots import conversations
 from nanobot.dots import store as s
 from nanobot.dots.permissions import tool_target
-from nanobot.dots.transcript_outbox import APPROVAL_ID, INBOUND_ID
+from nanobot.dots.transcript_outbox import APPROVAL_ID, APPROVAL_LINE, INBOUND_ID
 from nanobot.dots.turns import MEMORY_INDEX_MAX_CHARS, OpeningMessage, TurnUnit
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META
 from nanobot.session.summary import SUMMARY_CONTINUATION_TEXT
@@ -93,8 +93,15 @@ class TestAFile:
             {
                 "timestamp": "2023-05-20T09:01:00",
                 "role": "user",
-                "content": "[The user approved your exec call (ap1).]",
-                METADATA_KEY: {APPROVAL_ID: "ap1"},
+                "content": '[The user approved your exec call (ap1). Call exec again now with exactly these arguments: {"command":"ls"}]',
+                METADATA_KEY: {APPROVAL_ID: "ap1", APPROVAL_LINE: "The person approved the exec call (ls)."},
+            },
+            # One written before decisions had a line of their own: it is named, and its arguments stay out too.
+            {
+                "timestamp": "2023-05-20T09:01:30",
+                "role": "user",
+                "content": '[The user approved your exec call (ap0). Call exec again now with exactly these arguments: {"command":"pwd"}]',
+                METADATA_KEY: {APPROVAL_ID: "ap0"},
             },
             person('[Automation "fares" fired] check the fares', "2023-05-20T09:02:00"),
         ]
@@ -103,7 +110,9 @@ class TestAFile:
 
         assert "Please provide" not in text
         assert SUMMARY_CONTINUATION_TEXT not in text
-        assert "## 09:01 approval\n\n[The user approved your exec call (ap1).]" in text
+        assert "## 09:01 approval\n\nThe person approved the exec call (ls)." in text
+        assert "## 09:01 approval\n\nThe person decided on a call." in text
+        assert "arguments" not in text and "pwd" not in text
         assert '## 09:02 automation\n\n[Automation "fares" fired] check the fares' in text
 
     def test_a_task_is_a_file_named_by_the_day_it_started(self) -> None:
@@ -229,3 +238,51 @@ class TestMemoryMd:
         system = h.provider.requests[0]["messages"][0]["content"]
         assert "x" * MEMORY_INDEX_MAX_CHARS + "\n\n(MEMORY.md is cut here" in system
         assert "x" * (MEMORY_INDEX_MAX_CHARS + 1) not in system
+
+
+PROXY = "http://shopper:Pw7c1dSecret@10.0.0.5:8099"
+
+
+class TestSecrets:
+    def test_a_known_secret_is_masked_in_what_the_person_and_the_dot_said(self) -> None:
+        messages = [
+            person(f"use the proxy {PROXY} for the shop", "2023-05-20T09:00:00"),
+            dot("done: the password Pw7c1dSecret works", "2023-05-20T09:00:05"),
+        ]
+
+        (text,) = conversations.chat_files(
+            messages, 0, target=no_target, secrets=conversations.proxy_secrets(PROXY)
+        ).values()
+
+        assert "Pw7c1dSecret" not in text and "shopper:" not in text
+        assert "use the proxy *** for the shop" in text and "the password *** works" in text
+
+    def test_a_decision_tells_the_files_its_call_and_target_never_its_arguments(self) -> None:
+        from nanobot.dots.engine import approval_line
+
+        approval = s.Approval(
+            approval_id="ap1", session_key="chat", task_id=None, tool_call_id="c1", tool="browser_identity_create",
+            permission="browser.identity.create", arguments={"name": "shopping", "proxy": PROXY}, status="approved",
+            note="ok", run_tool_call_id=None, created_at=0, resolved_at=None,
+        )
+
+        line = approval_line(approval, approved=True)
+
+        assert line.startswith("The person approved the browser_identity_create call (")
+        assert "shopping" in line and "Pw7c1dSecret" not in line and "10.0.0.5" not in line
+
+    async def test_a_proxy_stays_masked_after_its_identity_is_deleted(self, make_harness: MakeHarness) -> None:
+        h = make_harness([says("noted"), says("still noted")])
+        today = datetime.now().strftime("%Y-%m-%d")
+        h.store.write(lambda conn: s.insert_identity(conn, identity_id="id1", name="shopping", proxy=PROXY))
+        h.accept("in1", f"the proxy is {PROXY}")
+        await h.run(chat_unit(f"the proxy is {PROXY}", "in1"))
+        h.store.write(lambda conn: s.delete_identity(conn, "id1"))
+
+        # The day's file is written again whole by the next turn.
+        h.accept("in2", "anything else?")
+        await h.run(chat_unit("anything else?", "in2"))
+
+        text = read(h, f"chat/{today}.md") or ""
+        assert "anything else?" in text and "the proxy is ***" in text
+        assert "Pw7c1dSecret" not in text
