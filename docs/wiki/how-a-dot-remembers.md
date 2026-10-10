@@ -99,8 +99,8 @@ other note. The Dot sees it whole in every prompt, up to 25,000 characters
 
 A model often does not think to write it while it works, so the engine keeps
 it current itself: once the Dot has been quiet for five minutes, it takes the
-conversation files that changed since the last time and has the summary model
-rewrite `MEMORY.md` from them, in one request with no tools. A changed fact
+messages said since the last pass (of a long day, only the new ones) and has the
+summary model rewrite `MEMORY.md` from them, in one request with no tools. A changed fact
 replaces the old one with its date; nothing a web page or a command said is
 copied in as an instruction. If the conversations do not fit one request they
 go in several, oldest first. A pass that is cut, empty, unpriced, or races

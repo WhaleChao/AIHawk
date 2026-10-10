@@ -2,15 +2,17 @@
 
 MEMORY.md (in the Dot's memory directory) is given to the Dot in every prompt: what it should always know about
 the person. The Dot may write it while it works, but a model often does not think to, so when the Dot has been
-quiet for a while the engine takes in the conversation files that changed since the last pass
-(`conversations.py`) and has the summary model rewrite MEMORY.md from them, in one request with no tools
+quiet for a while the engine takes in what was said since the last pass (the conversation files,
+`conversations.py`) and has the summary model rewrite MEMORY.md from them, in one request with no tools
 (templates/agent/memory_update.md). Measured on LongMemEval (tests/bench/README.md): a profile written this way
 raised the answers that need what the person likes from 65% to 83%, as well as the best of the open-source
 memory systems tried, at about a seventeenth of their cost; an agent doing the same with file tools did worse
 (75%) at five times the cost.
 
-A pass takes the files whose time is after the newest it took last (`KV_THROUGH`), oldest first, as many to a
-request as the model's window holds; a file too long for one request is cut between its messages. Each request
+A pass takes the files whose time is after the newest it took last (`KV_THROUGH`), oldest first, and of each
+only the messages it has not taken yet (`KV_TAKEN`): a file is written again whole after every turn but only
+grows at its end, so the chat of a long day is read once, not again at every pass. As many go to a request as the
+model's window holds; a file too long for one request is cut between its messages. Each request
 answers with the whole new MEMORY.md, written before the next one starts, so a pass cut short keeps what it
 did. A request that is cut, empty or unpriced writes nothing; so does one whose MEMORY.md the Dot changed while
 it ran (the next pass takes the files again). Its spend has a ledger of its own (`SESSION_KEY`), capped like a
@@ -19,8 +21,9 @@ task's, and is reported by the `memory.updated` that ends a pass.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Literal
 
@@ -44,8 +47,11 @@ from nanobot.utils.prompt_templates import render_template
 QUIET_S = 5 * 60
 # The ledger of what passes spend, and the session key their requests are metered under.
 SESSION_KEY = "memory"
-# dots_kv: the time of the newest conversation file a pass took in.
+# dots_kv: the time of the newest conversation file a pass took in, and how many messages of each file it took.
 KV_THROUGH = "memory_updated_through"
+KV_TAKEN = "memory_messages_taken"
+# What separates the messages of a conversation file (`conversations.render`): a file is its title, then these.
+MESSAGE_BREAK = "\n\n## "
 # The model role that writes MEMORY.md: the one that summarises a long thread.
 MODEL_ROLE = "summary"
 MEMORY_PATH = f"{MEMORY_DIR}/{MEMORY_INDEX}"
@@ -63,12 +69,14 @@ class PassOutcome:
 
 @dataclass(frozen=True)
 class _Conversation:
-    """A conversation file, or a piece of one; `last` is false on every piece of a file but its last."""
+    """The messages of a conversation file a pass has not taken yet, or a piece of them; `last` is false on every
+    piece but its last, and `messages` is how many the file holds in all."""
 
     path: str
     mtime: datetime
     text: str
     last: bool = True
+    messages: int = 0
 
 
 def _parse_time(value: str) -> datetime:
@@ -84,7 +92,7 @@ def _pieces(conversation: _Conversation, fits: Callable[[list[_Conversation]], b
         return [conversation]
 
     def piece(text: str) -> _Conversation:
-        return _Conversation(conversation.path, conversation.mtime, text, last=False)
+        return replace(conversation, text=text, last=False)
 
     blocks = conversation.text.split("\n## ")
     pieces: list[_Conversation] = []
@@ -106,7 +114,7 @@ def _pieces(conversation: _Conversation, fits: Callable[[list[_Conversation]], b
             current = current[cut:]
     if current:
         pieces.append(piece(current))
-    return [*pieces[:-1], _Conversation(conversation.path, conversation.mtime, pieces[-1].text)]
+    return [*pieces[:-1], replace(conversation, text=pieces[-1].text)]
 
 
 def batches(conversations_: Sequence[_Conversation], fits: Callable[[list[_Conversation]], bool]) -> list[list[_Conversation]]:
@@ -164,10 +172,15 @@ class MemoryUpdater:
             return PassOutcome("failed", f"the computer did not answer: {exc}")
 
     async def _run(self, settings: EngineSettings) -> PassOutcome:
-        through_text = self._store.read(lambda conn: dots_store.read_kv(conn, KV_THROUGH))
+        through_text, taken = self._store.read(
+            lambda conn: (dots_store.read_kv(conn, KV_THROUGH), dots_store.read_kv(conn, KV_TAKEN) or {})
+        )
         through = _parse_time(through_text) if isinstance(through_text, str) else None
-        changed = await self._changed(through)
+        changed, newest_seen = await self._changed(through, taken)
         if not changed:
+            if newest_seen is not None:
+                # Files written again with nothing new (a mask added, say): past them, so no pass reads them again.
+                self._store.write(lambda conn: dots_store.write_kv(conn, KV_THROUGH, newest_seen.isoformat()))
             return PassOutcome("nothing")
 
         spend = TurnSpend(self._store, SESSION_KEY, settings.max_cost_usd, "memory pass")
@@ -213,11 +226,17 @@ class MemoryUpdater:
                 return PassOutcome("failed", "MEMORY.md was changed while the pass ran")
             await self._computer.write_bytes(MEMORY_PATH, f"{text}\n".encode())
             memory = text
-            # Only a file taken in whole moves the mark: a pass cut between the pieces of one takes it again.
-            whole = [c.mtime for c in group if c.last]
+            # Only a file taken in whole moves the marks: a pass cut between the pieces of one takes it again.
+            whole = [c for c in group if c.last]
             if whole:
-                newest = max(whole).isoformat()
-                self._store.write(lambda conn: dots_store.write_kv(conn, KV_THROUGH, newest))
+                taken.update({c.path: c.messages for c in whole})
+                newest = max(c.mtime for c in whole).isoformat()
+
+                def mark(conn: sqlite3.Connection) -> None:
+                    dots_store.write_kv(conn, KV_THROUGH, newest)
+                    dots_store.write_kv(conn, KV_TAKEN, taken)
+
+                self._store.write(mark)
 
         changed_memory = memory != before
         self._store.write(
@@ -228,8 +247,15 @@ class MemoryUpdater:
         logger.info("memory pass took in {} conversation files; MEMORY.md changed={}", len(changed), changed_memory)
         return PassOutcome("updated")
 
-    async def _changed(self, through: datetime | None) -> list[_Conversation]:
-        """The conversation files whose time is after `through`, oldest first, with their text."""
+    async def _changed(
+        self, through: datetime | None, taken: dict[str, int]
+    ) -> tuple[list[_Conversation], datetime | None]:
+        """The messages not taken yet of the conversation files whose time is after `through`, oldest first.
+
+        A file keeps its title; one taken in part before says so, so the model reads its messages as the rest of a
+        conversation it has seen. A file that holds fewer messages than were taken of it was written anew (by an
+        upgrade's first write): all of it is taken again. With them, the time of the newest file seen.
+        """
         found: list[tuple[datetime, str]] = []
         for source in SOURCES:
             directory = f"{conversations.CONVERSATIONS_DIR}/{source}"
@@ -242,9 +268,18 @@ class MemoryUpdater:
         out: list[_Conversation] = []
         for mtime, path in sorted(found):
             data = await self._computer.read_bytes(path)
-            if data is not None:
-                out.append(_Conversation(path, mtime, data.decode("utf-8", errors="replace")))
-        return out
+            if data is None:
+                continue
+            title, *messages = data.decode("utf-8", errors="replace").rstrip("\n").split(MESSAGE_BREAK)
+            done = taken.get(path, 0)
+            if done > len(messages):
+                done = 0
+            if done == len(messages):
+                continue
+            heading = f"{title} (continued: its earlier messages were taken in before)" if done else title
+            text = MESSAGE_BREAK.join([heading, *messages[done:]]) + "\n"
+            out.append(_Conversation(path, mtime, text, messages=len(messages)))
+        return out, max((mtime for mtime, _ in found), default=None)
 
     async def _read_memory(self) -> str:
         data = await self._computer.read_bytes(MEMORY_PATH)

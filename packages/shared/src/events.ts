@@ -217,10 +217,10 @@ export interface OutboundEventDataMap {
    */
   "automation.next_run": { next_run_at_ms: number | null };
   /**
-   * The Dot brought its MEMORY.md (what it is given about the person in every prompt) up to date from the
-   * conversations that changed since the last time, once it had been quiet for a while (the engine's
-   * `memory_update.py`): how many conversation files it took in, whether MEMORY.md changed, and what the pass cost
-   * (with the cost of any pass that failed since the last of these).
+   * The Dot brought its MEMORY.md (what it is given about the person in every prompt) up to date from what was said
+   * since the last time, once it had been quiet for a while (the engine's `memory_update.py`): how many conversation
+   * files it took messages from, whether MEMORY.md changed, and what the pass cost (with the cost of any pass that
+   * failed since the last of these).
    */
   "memory.updated": { conversations: number; changed: boolean } & SpentUsd;
 }

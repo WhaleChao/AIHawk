@@ -124,6 +124,40 @@ class TestAPass:
         assert "book the vet" in first and "my cat is called Luna" in first
         assert "I moved to Rome" in second and "my cat is called Luna" not in second and "book the vet" not in second
 
+    async def test_a_day_that_grew_sends_only_its_new_messages(self, make_pass) -> None:
+        p = make_pass([says(PROFILE), says(PROFILE + "\n- moved to Rome (2023-05-20)")])
+        p.conversation("2023-05-20.md", DAY)
+        await p.updater.run()
+
+        p.conversation("2023-05-20.md", DAY + "\n## 18:00 the person\n\nI moved to Rome\n\n## 18:00 you\n\nNoted.\n")
+        assert await p.updater.run() == m.PassOutcome("updated")
+
+        second = p.provider.requests[1]["messages"][0]["content"]
+        assert "# Chat, 2023-05-20 (continued: its earlier messages were taken in before)" in second
+        assert "I moved to Rome" in second and "my cat is called Luna" not in second
+
+    async def test_a_file_written_again_with_nothing_new_asks_nothing_and_is_passed(self, make_pass) -> None:
+        p = make_pass([says(PROFILE)])
+        p.conversation("2023-05-20.md", DAY)
+        await p.updater.run()
+        p.conversation("2023-05-20.md", DAY)
+        mark = p.through()
+
+        assert await p.updater.run() == m.PassOutcome("nothing")
+        assert len(p.provider.requests) == 1
+        assert p.through() != mark
+
+    async def test_a_file_with_fewer_messages_than_were_taken_is_taken_whole(self, make_pass) -> None:
+        p = make_pass([says(PROFILE), says(PROFILE)])
+        p.conversation("2023-05-20.md", DAY)
+        await p.updater.run()
+
+        p.conversation("2023-05-20.md", "# Chat, 2023-05-20\n\n## 20:00 the person\n\nstarting over\n")
+        await p.updater.run()
+
+        second = p.provider.requests[1]["messages"][0]["content"]
+        assert "starting over" in second and "(continued" not in second
+
     async def test_an_answer_cut_or_empty_writes_nothing_and_takes_the_conversations_again(self, make_pass) -> None:
         p = make_pass([LLMResponse(content="## The pers", finish_reason="length"), says("   "), says(PROFILE)])
         p.write_memory("old\n")
@@ -235,6 +269,26 @@ class TestAPass:
 
 
 class TestTheEngine:
+    async def test_the_second_pass_of_a_day_reads_only_what_was_said_since_the_first(
+        self, tmp_path: Path, dot_store: DotStore
+    ) -> None:
+        # The files are the turns' own (conversations.render): a pass splits them where render joins them.
+        h = EngineHarness(
+            tmp_path, dot_store, [says("hi"), says(PROFILE), says("noted"), says(PROFILE + "\n- moved")], memory_quiet_s=0.2
+        )
+        h.configure(runtime_config_body())
+        h.engine.start()
+        h.engine.accept(user_message("in1", "my cat is called Luna"))
+        await h.wait_until(lambda: len(h.events_of("memory.updated")) == 1)
+
+        h.engine.accept(user_message("in2", "I moved to Rome"))
+        await h.wait_until(lambda: len(h.events_of("memory.updated")) == 2)
+
+        second = h.provider.requests[3]["messages"][0]["content"]
+        assert "(continued: its earlier messages were taken in before)" in second
+        assert "I moved to Rome" in second and "my cat is called Luna" not in second
+        await h.engine.stop()
+
     async def test_a_pass_runs_once_the_dot_has_been_quiet_after_a_turn(self, tmp_path: Path, dot_store: DotStore) -> None:
         h = EngineHarness(tmp_path, dot_store, [says("hi"), says(PROFILE)], memory_quiet_s=0.2)
         h.configure(runtime_config_body())

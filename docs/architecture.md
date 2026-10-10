@@ -850,8 +850,8 @@ guest's report: it is never used to enforce anything (the cap is the guest's).
 
 `memory.updated {conversations, changed}` ends a memory pass (section 8.6): the
 Dot had been quiet for a while, and the summary model rewrote its `MEMORY.md`
-from the conversation files that changed since the last pass. `conversations`
-is how many files it took in, `changed` whether `MEMORY.md` is different. A pass
+from what was said since the last pass. `conversations` is how many
+conversation files it took messages from, `changed` whether `MEMORY.md` is different. A pass
 that found nothing new sends nothing, and one that failed sends nothing either:
 its spend goes with the next `memory.updated`.
 
@@ -1362,8 +1362,10 @@ are cut with a marker.
 - The memory pass (`memory_update.py`): a model often does not think to write
   what it learns about the person, so once no turn has run for 5 minutes after
   a turn (or after a start), the engine takes the conversation files whose time
-  is after the newest it took last and has the `summary` model rewrite
-  MEMORY.md from them and the current MEMORY.md, in one request with no tools
+  is after the newest it took last, and of each only the messages it has not
+  taken yet (a file is written again whole after every turn but only grows at
+  its end, so a long day's chat is read once), and has the `summary` model
+  rewrite MEMORY.md from them and the current MEMORY.md, in one request with no tools
   (`templates/agent/memory_update.md`: atomic facts with their day, a changed
   fact replacing the old one, nothing copied from what a web page or a command
   said). Files that do not fit one request go in several, oldest first, a long
