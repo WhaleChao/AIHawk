@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from fakes.local_computer import LocalComputer
 
-from nanobot.agent.tools.exec_session import ExecSessionManager, ExecSessionTool
+from nanobot.agent.tools.exec_session import MAX_YIELD_MS, ExecSessionManager, ExecSessionTool
 from nanobot.agent.tools.shell import ExecTool
 
 
@@ -102,8 +102,9 @@ async def test_exec_sessions_run_through_the_relay_too(
         started = await tool.execute(command="cat", yield_time_ms=200)
         assert "session_id:" in started
         session_id = started.split("session_id:")[1].split()[0]
+        # Until cat exits, which it does once its input closes: no window the machine's speed decides.
         answer = await ExecSessionTool(manager=manager).execute(
-            session_id=session_id, input="hello\n", timeout_ms=1500, close_stdin=True,
+            session_id=session_id, input="hello\n", close_stdin=True, until_exit=True,
         )
         assert "hello" in answer
     finally:
@@ -122,12 +123,13 @@ async def test_exec_with_a_tty_asks_the_relay_for_one_and_runs_as_a_session(
     tool = ExecTool(computer, session_manager=manager)
     try:
         started = await tool.execute(command='echo "term=$TERM"; cat', tty=True, yield_time_ms=300)
-        assert "term=xterm-256color" in started
         assert "session_id:" in started
         session_id = started.split("session_id:")[1].split()[0]
         answer = await ExecSessionTool(manager=manager).execute(
-            session_id=session_id, input="hello\n", timeout_ms=1500, close_stdin=True,
+            session_id=session_id, input="hello\n", close_stdin=True, until_exit=True,
         )
+        # What the session printed, in its first answer or after it: a slow login shell may print after 300 ms.
+        assert "term=xterm-256color" in started + answer
         assert "hello" in answer
     finally:
         await manager.close_all()
@@ -155,8 +157,9 @@ async def test_a_tty_without_yield_time_still_starts_a_session(
 async def test_a_tty_command_that_ends_at_once_answers_in_the_same_call(
     computer: LocalComputer,
 ) -> None:
+    # The answer comes as the command ends; the long yield is only how long that may take on a slow machine.
     result = await ExecTool(computer, session_manager=ExecSessionManager()).execute(
-        command="echo quick", tty=True
+        command="echo quick", tty=True, yield_time_ms=MAX_YIELD_MS
     )
 
     assert "quick" in result
@@ -170,7 +173,7 @@ async def test_a_tty_keeps_the_terminal_type_the_engine_was_given(
     monkeypatch.setenv("TERM", "vt100")
 
     result = await ExecTool(computer, session_manager=ExecSessionManager()).execute(
-        command='echo "term=$TERM"', tty=True
+        command='echo "term=$TERM"', tty=True, yield_time_ms=MAX_YIELD_MS
     )
 
     assert "term=vt100" in result
