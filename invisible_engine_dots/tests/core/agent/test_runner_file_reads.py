@@ -199,37 +199,6 @@ async def test_failed_file_read_restores_context(tmp_path, monkeypatch, error):
     assert await run_tool(tools, "read_file", {"path": "data.txt"}) == contents
 
 
-async def test_native_compaction_invalidates_old_results_but_new_reads_can_dedup(tmp_path):
-    tools = _tools(tmp_path)
-    provider = MagicMock(spec=LLMProvider)
-    requests = []
-
-    async def request(*, messages, **_kwargs):
-        requests.append(deepcopy(messages))
-        if len(requests) <= 3:
-            return LLMResponse(
-                content=None,
-                tool_calls=[ToolCallRequest(
-                    id=f"read-{len(requests)}", name="read_file", arguments={"path": "data.txt"},
-                )],
-                provider_compaction_applied=len(requests) == 2,
-                provider_compaction_scope="current_request" if len(requests) == 2 else None,
-            )
-        return LLMResponse(content="done")
-
-    provider.chat_stream_with_retry = request
-    result = await AgentRunner().run(make_run_spec(
-        provider, model="test-model", tools=tools,
-        initial_messages=[{"role": "user", "content": "Read data.txt."}],
-        max_iterations=4, max_tool_result_chars=128_000,
-    ))
-    observations = [message["content"] for message in result.messages if message.get("role") == "tool"]
-    assert "1| alpha" in observations[0]
-    assert observations[1] == observations[0]
-    assert observations[2] == "[File unchanged since last read: data.txt]"
-    assert any(message.get("tool_call_id") == "read-1" for message in requests[2])
-
-
 async def test_concurrent_sessions_keep_separate_read_contexts(tmp_path, monkeypatch):
     tools = _tools(tmp_path)
     session_a, session_b = FileStates(), FileStates()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,7 +18,6 @@ from nanobot.agent.context_governance import (
     ContextGovernor,
     HistoryConsolidator,
     ModelRequestState,
-    ProviderCompactionConsolidator,
     TranscriptBuilder,
 )
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
@@ -33,10 +32,8 @@ from nanobot.providers.base import (
     LLMResponse,
     LLMUsage,
     ProviderCallContext,
-    ProviderConversationState,
     ToolCallRequest,
 )
-from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.summary import SessionSummaryCheckpoint
 from nanobot.utils.helpers import (
@@ -97,9 +94,7 @@ class AgentRunSpec:
     workspace: Path | None = None
     session_key: str | None = None
     checkpoint_callback: CheckpointCallback | None = None
-    consolidate_provider_compaction: ProviderCompactionConsolidator | None = None
     injection_callback: InjectionCallback | None = None
-    provider_state: ProviderConversationState | None = None
     events: EventSink = NO_EVENTS
     # Given the messages of a model request, returns the ones to send. For what the model must see
     # and the transcript must not keep (a screenshot): the result is made for that request, never stored
@@ -123,9 +118,7 @@ class AgentRunResult:
     failure_error_kind: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
-    provider_state: ProviderConversationState | None = field(default=None, repr=False)
     summary_checkpoint: SessionSummaryCheckpoint | None = field(default=None, repr=False)
-    provider_compaction_applied: bool = field(default=False, repr=False)
 
 
 class AgentRunner:
@@ -307,7 +300,6 @@ class AgentRunner:
             spec.transcript_input,
             spec.transcript_builder,
             spec.consolidate_history,
-            spec.consolidate_provider_compaction,
         )
 
     async def _run_core(
@@ -332,13 +324,6 @@ class AgentRunner:
         pending_length_segment: str | None = None
         had_injections = False
         injection_cycles = 0
-        conversation_state = ProviderConversationStateController(
-            provider=spec.runtime.provider,
-            model=spec.runtime.model,
-            messages=messages,
-            state=spec.provider_state,
-            session_id=spec.session_key,
-        )
         governance_config = ContextGovernanceConfig(
             provider=spec.runtime.provider,
             model=spec.runtime.model,
@@ -351,7 +336,6 @@ class AgentRunner:
         )
         request_state = ModelRequestState(
             config=governance_config,
-            conversation=conversation_state,
             compaction=compaction,
             events=spec.events,
         )
@@ -398,11 +382,9 @@ class AgentRunner:
                 spec,
                 request_messages,
                 request_state=request_state,
-                transcript=messages,
             )
             assert request_state.messages is not None
             messages_for_model = request_state.messages
-            conversation_state.observe_response(response, messages)
             request_state.compaction.accept_request(
                 messages_for_model,
                 raw_boundary=request_message_count,
@@ -429,10 +411,6 @@ class AgentRunner:
                     tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
-                )
-                assistant_message = conversation_state.project_response_message(
-                    assistant_message,
-                    response,
                 )
                 await self._commit(spec, messages, assistant_message, "assistant_tool_calls")
 
@@ -465,7 +443,6 @@ class AgentRunner:
                     hook=hook,
                     context=context,
                     model_messages=messages_for_model,
-                    compacted_tool_results=request_state.compacted_tool_results,
                     gate=spec.gate,
                     on_result=commit_tool_result,
                 )
@@ -522,7 +499,6 @@ class AgentRunner:
                     spec,
                     messages_for_model,
                     request_state=request_state,
-                    transcript=messages,
                 )
                 retry_usage = self._record_request_usage(spec, request_state, response)
                 round_usages.append(retry_usage)
@@ -549,13 +525,10 @@ class AgentRunner:
                     await self._commit(
                         spec,
                         messages,
-                        conversation_state.project_response_message(
-                            build_assistant_message(
-                                clean,
-                                reasoning_content=response.reasoning_content,
-                                thinking_blocks=response.thinking_blocks,
-                            ),
-                            response,
+                        build_assistant_message(
+                            clean,
+                            reasoning_content=response.reasoning_content,
+                            thinking_blocks=response.thinking_blocks,
                         ),
                         "length_segment",
                     )
@@ -571,10 +544,6 @@ class AgentRunner:
                     clean,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
-                )
-                assistant_message = conversation_state.project_response_message(
-                    assistant_message,
-                    response,
                 )
 
             # Inputs that arrived while the model answered are taken in, and the run goes on.
@@ -641,13 +610,10 @@ class AgentRunner:
                 spec,
                 messages,
                 assistant_message
-                or conversation_state.project_response_message(
-                    build_assistant_message(
-                        clean,
-                        reasoning_content=response.reasoning_content,
-                        thinking_blocks=response.thinking_blocks,
-                    ),
-                    response,
+                or build_assistant_message(
+                    clean,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
                 ),
                 "final_response",
             )
@@ -688,9 +654,7 @@ class AgentRunner:
             failure_error_kind=failure_error_kind,
             tool_events=tool_events,
             had_injections=had_injections,
-            provider_state=conversation_state.finish(messages),
             summary_checkpoint=request_state.compaction.summary_checkpoint,
-            provider_compaction_applied=request_state.provider_compaction_applied,
         )
 
     def _build_request_kwargs(
@@ -713,6 +677,11 @@ class AgentRunner:
         kwargs["reasoning_effort"] = generation.reasoning_effort
         return kwargs
 
+    @staticmethod
+    def _provider_context(spec: AgentRunSpec) -> ProviderCallContext:
+        """Where a request reports its retries, and the preset its answer is attributed to."""
+        return ProviderCallContext(events=spec.events, response_preset=spec.runtime.model_preset or "")
+
     async def _request_model(
         self,
         spec: AgentRunSpec,
@@ -720,14 +689,12 @@ class AgentRunner:
         *,
         request_state: ModelRequestState,
         malformed_retry: bool = False,
-        transcript: list[dict[str, Any]] | None,
     ) -> tuple[LLMResponse, LLMUsage]:
         tool_definitions = spec.tools.get_definitions()
-        messages, provider_context = await self.context_governor.prepare_request(
+        messages = await self.context_governor.prepare_request(
             request_state,
             messages,
             tool_definitions=tool_definitions,
-            transcript=transcript,
         )
 
         kwargs = self._build_request_kwargs(
@@ -736,20 +703,10 @@ class AgentRunner:
             tools=tool_definitions,
             answer_tokens=request_state.answer_tokens,
         )
-        provider_context = replace(
-            provider_context or ProviderCallContext(),
-            response_preset=spec.runtime.model_preset or "",
-        )
         response = await spec.runtime.provider.chat_stream_with_retry(
             **kwargs,
-            provider_context=provider_context,
+            provider_context=self._provider_context(spec),
         )
-        await self.context_governor.summarize_provider_compaction(
-            request_state,
-            response,
-            current_request_boundary=(len(transcript) if transcript is not None else None),
-        )
-        request_state.provider_compaction_applied |= response.provider_compaction_applied
         round_usage = self._record_request_usage(spec, request_state, response)
         dropped, all_dropped, original_finish_reason = (
             self._drop_malformed_tool_calls(response)
@@ -770,7 +727,6 @@ class AgentRunner:
                 spec, retry_messages,
                 request_state=request_state,
                 malformed_retry=True,
-                transcript=None,
             )
             return retry_response, round_usage + retry_usage
         if (
@@ -827,10 +783,6 @@ class AgentRunner:
             original_finish_reason,
         )
         response.tool_calls = valid
-        # The opaque candidate still contains every raw function_call item.
-        # Advancing it after dropping even one call would replay an unmatched
-        # call without a corresponding tool output on the next request.
-        response.provider_state = None
         if not valid:
             response.finish_reason = "stop"
         return (dropped, not valid, original_finish_reason)
@@ -862,21 +814,13 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         *,
         request_state: ModelRequestState,
-        transcript: list[dict[str, Any]],
     ) -> LLMResponse:
         retry_messages = self._finalization_retry_messages(messages)
-        response = await self._request_no_tools(
+        return await self._request_no_tools(
             spec,
             retry_messages,
             request_state=request_state,
-            transcript=transcript,
         )
-        request_state.conversation.observe_response(
-            response,
-            transcript,
-            adopt_candidate_state=False,
-        )
-        return response
 
     @staticmethod
     def _finalization_retry_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -890,13 +834,11 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         *,
         request_state: ModelRequestState,
-        transcript: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
-        messages, provider_context = await self.context_governor.prepare_request(
+        messages = await self.context_governor.prepare_request(
             request_state,
             messages,
             tool_definitions=None,
-            transcript=transcript,
         )
         kwargs = self._build_request_kwargs(
             spec,
@@ -904,20 +846,10 @@ class AgentRunner:
             tools=None,
             answer_tokens=request_state.answer_tokens,
         )
-        response = await spec.runtime.provider.chat_stream_with_retry(
+        return await spec.runtime.provider.chat_stream_with_retry(
             **kwargs,
-            provider_context=replace(
-                provider_context or ProviderCallContext(),
-                response_preset=spec.runtime.model_preset or "",
-            ),
+            provider_context=self._provider_context(spec),
         )
-        await self.context_governor.summarize_provider_compaction(
-            request_state,
-            response,
-            current_request_boundary=(len(transcript) if transcript is not None else None),
-        )
-        request_state.provider_compaction_applied |= response.provider_compaction_applied
-        return response
 
     @staticmethod
     def _max_iterations_fallback(spec: AgentRunSpec) -> str:

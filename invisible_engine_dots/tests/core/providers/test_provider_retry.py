@@ -10,7 +10,6 @@ from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
     ProviderCallContext,
-    ProviderConversationState,
 )
 
 
@@ -339,36 +338,7 @@ async def test_successful_image_retry_mutates_original_messages_in_place() -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("messages", "payload", "pending_messages"),
-    [
-        (_IMAGE_MSG, {}, _IMAGE_MSG),
-        (
-            [{"role": "user", "content": "continue"}],
-            {
-                "items": [
-                    {
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_image",
-                                "image_url": "data:image/png;base64,abc",
-                            }
-                        ],
-                    }
-                ]
-            },
-            [],
-        ),
-    ],
-    ids=["pending-image", "opaque-payload-image"],
-)
-async def test_image_retry_discards_provider_state_with_images(
-    messages,
-    payload,
-    pending_messages,
-) -> None:
+async def test_image_retry_keeps_the_provider_context() -> None:
     class ContextScriptedProvider(ScriptedProvider):
         def __init__(self, responses):
             super().__init__(responses)
@@ -387,36 +357,23 @@ async def test_image_retry_discards_provider_state_with_images(
         LLMResponse(content="model does not support images", finish_reason="error"),
         LLMResponse(content="ok, no image"),
     ])
-    messages = copy.deepcopy(messages)
-    state = ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="gpt-5.6",
-        version=1,
-        payload=copy.deepcopy(payload),
-        pending_messages=copy.deepcopy(pending_messages),
-    )
+    messages = copy.deepcopy(_IMAGE_MSG)
 
     response = await provider.chat_stream_with_retry(
         messages=messages,
         provider_context=ProviderCallContext(
-            conversation_state=state,
-            session_id="webui:cache-test",
             response_preset="saved fallback",
             response_is_fallback=True,
         ),
     )
 
     assert response.content == "ok, no image"
+    assert provider.calls == 2
     retry_context = provider.contexts[-1]
     assert isinstance(retry_context, ProviderCallContext)
-    assert retry_context.conversation_state is None
-    assert retry_context.session_id == "webui:cache-test"
     assert retry_context.response_preset == "saved fallback"
     assert retry_context.response_is_fallback is True
-    public_content = messages[0]["content"]
-    if isinstance(public_content, list):
-        assert all(block.get("type") != "image_url" for block in public_content)
+    assert all(block.get("type") != "image_url" for block in messages[0]["content"])
 
 
 @pytest.mark.asyncio

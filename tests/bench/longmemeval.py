@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -276,6 +277,24 @@ def report(out: Path, references: dict[str, dict[str, Any]]) -> None:
     print("\n".join(lines))
 
 
+@contextlib.contextmanager
+def owning(out: Path):
+    """One run or judge at a time on a directory: two would answer, or grade, the same questions twice (it
+    happened: a second run started on a directory still in use doubled its judged rows)."""
+    out.mkdir(parents=True, exist_ok=True)
+    lock = out / ".lock"
+    try:
+        handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise SystemExit(f"{out} is in use by another run or judge: remove {lock} if none is running") from None
+    os.write(handle, str(os.getpid()).encode())
+    os.close(handle)
+    try:
+        yield
+    finally:
+        lock.unlink(missing_ok=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -289,10 +308,11 @@ def main() -> None:
     commands.choices["run"].add_argument("--limit", type=int, help="only the first N of the questions (a pilot)")
     commands.choices["run"].add_argument("-n", type=int, default=4)
     args = parser.parse_args()
-    if args.command == "run":
-        asyncio.run(run(args))
-    else:
-        judge(args)
+    with owning(Path(args.out)):
+        if args.command == "run":
+            asyncio.run(run(args))
+        else:
+            judge(args)
 
 
 if __name__ == "__main__":

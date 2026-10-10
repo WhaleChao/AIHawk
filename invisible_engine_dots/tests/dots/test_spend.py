@@ -82,7 +82,7 @@ class TestTheMeter:
 
         assert provider.generation.max_tokens == 321
         assert provider.get_default_model() == "scripted/model"
-        assert provider.supports_pre_request_compaction("m") == scripted.supports_pre_request_compaction("m")
+        assert await provider.model_limits("m") == await scripted.model_limits("m")
 
 
 class TestTheRetriesOfARequest:

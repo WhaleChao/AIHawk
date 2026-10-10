@@ -166,7 +166,22 @@ rest is deleted, with the tests that pinned it:
   read, and `OpenAICompatProvider._parse`, the response parser of the non-streaming
   call (`_parse_chunks` is the one parser);
 - the `persistent` retry mode (`retry_mode`, `_PERSISTENT_MAX_DELAY`,
-  `_PERSISTENT_IDENTICAL_ERROR_LIMIT`, the identical-error counter).
+  `_PERSISTENT_IDENTICAL_ERROR_LIMIT`, the identical-error counter);
+- the provider-owned conversation state and the provider-native compaction: no provider
+  of the Dot resumes state kept on the provider's side or compacts there
+  (`OpenAICompatProvider` returns no state and reports no compaction), so the runner
+  only ever took the paths of a provider without them. Deleted: providers/conversation_state.py
+  (`ProviderConversationStateController`), `ProviderConversationState`,
+  `LLMProvider.can_resume_conversation_state` and `supports_pre_request_compaction`,
+  `LLMResponse.provider_state`, `provider_compaction_applied`, `provider_compaction_state`,
+  `provider_compaction_scope` and `preserve_provider_state_on_error`, the fields
+  `conversation_state`, `context_window_tokens`, `session_id` and `compaction_input_budget`
+  of `ProviderCallContext` (it keeps the event sink and the response preset),
+  `AgentRunSpec.provider_state` and `consolidate_provider_compaction`,
+  `AgentRunResult.provider_state` and `provider_compaction_applied`, the resumed-state
+  measurement of `ContextGovernor.measure_request`, `ContextGovernor.summarize_provider_compaction`,
+  `Consolidator.summarize_provider_compaction` and its `provider_state` argument, and the
+  read results a native compaction made stale (`compacted_tool_results`).
 
 The one text of a provider failure is `LLMProvider.failure_text`: the provider's error
 body or the exception's message. The provider's own handling and the base class's `_safe_chat_stream` both use it.
@@ -178,9 +193,7 @@ Kept on purpose, with the reason, for the next cut to decide:
   tests drive its timer, its store and its recovery through them.
 - `_BoundedOutputBuffer.retained_chars`: the invariant that an unpolled session holds
   at most its bound is asserted through it.
-- the provider-conversation-state and native-compaction machinery
-  (providers/conversation_state.py and its use in the runner and in context_governance.py),
-  the retry notifications of `LLMProvider` (the Dot's runs carry no event sink, so the
+- the retry notifications of `LLMProvider` (the Dot's runs carry no event sink, so the
   provider context has no publisher and no notification is ever sent), the spill of a
   long tool result to a file (the Dot passes no workspace) and
   `AgentHook`'s lifecycle methods the Dot's hook does not override: each is exercised
