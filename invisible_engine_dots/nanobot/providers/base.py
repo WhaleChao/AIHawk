@@ -9,7 +9,6 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -33,7 +32,6 @@ RETRY_AFTER_BUFFER = 1
 CONTEXT_SAFETY_BUFFER = 1024
 
 RetryEventCallback = Callable[[str], Awaitable[None]]
-ProviderCompactionScope = Literal["prior_context", "current_request"]
 RetryStatusCallback = Callable[[RetryStatusEvent], Awaitable[None]]
 
 
@@ -140,59 +138,19 @@ def tool_arguments_json_for_replay(arguments: Any) -> str:
     return json.dumps(tool_arguments_object_for_replay(arguments), ensure_ascii=False)
 
 
-@dataclass
-class ProviderConversationState:
-    """Opaque provider-owned continuation state.
-
-    ``payload`` may contain encrypted reasoning or other provider-private
-    protocol items. Keep it out of normal logs and public chat history.
-    ``pending_messages`` are Chat-style messages produced after the most
-    recent provider response and are materialized by the owning provider on
-    the next request.
-    """
-
-    kind: str
-    provider: str
-    model: str
-    version: int
-    payload: dict[str, Any] = field(default_factory=dict, repr=False)
-    pending_messages: list[dict[str, Any]] = field(default_factory=list, repr=False)
-
-    def with_pending_messages(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> ProviderConversationState:
-        """Return a state copy with an isolated pending-message list."""
-        return ProviderConversationState(
-            kind=self.kind,
-            provider=self.provider,
-            model=self.model,
-            version=self.version,
-            payload=self.payload,
-            pending_messages=deepcopy(messages),
-        )
-
-
 @dataclass(frozen=True)
 class ProviderCallContext:
-    """Optional provider-owned continuation data for one model request.
+    """What the retry chain needs to know about one model request.
 
     The ``chat_stream`` contract stays provider-agnostic; a provider that
     consumes this context does so through ``chat_stream_with_context``, and
     every other provider inherits the context-free delegation.
-    ``session_id`` gives providers a stable conversation-scoped routing key
-    without exposing that identity in the public message transcript.
     """
 
-    conversation_state: ProviderConversationState | None = field(default=None, repr=False)
-    context_window_tokens: int | None = None
-    session_id: str | None = field(default=None, repr=False)
     events: EventSink = field(default=NO_EVENTS, repr=False, compare=False)
     # None opts out (auxiliary calls); an empty name denotes an unnamed preset.
     response_preset: str | None = None
     response_is_fallback: bool = False
-    # A pre-request compactor must fit this budget before sending the pending input.
-    compaction_input_budget: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,26 +351,6 @@ class LLMResponse:
     retry_after: float | None = None  # Provider supplied retry wait in seconds.
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1, MiMo etc.
     thinking_blocks: list[dict[str, Any]] | None = None  # extended thinking blocks
-    provider_state: ProviderConversationState | None = field(default=None, repr=False)
-    # True only when this response installed a new provider-native compaction
-    # boundary. Replaying an older compaction item does not set this flag.
-    provider_compaction_applied: bool = field(default=False, repr=False)
-    # State immediately after native compaction, before the normal response
-    # continues. An archive prompt can resume this state without replaying H.
-    provider_compaction_state: ProviderConversationState | None = field(
-        default=None,
-        repr=False,
-    )
-    # Which model input the native compaction state replaces. Providers that
-    # compact before attaching the current request delta report
-    # ``prior_context``; in-request compaction reports ``current_request``.
-    provider_compaction_scope: ProviderCompactionScope | None = field(
-        default=None,
-        repr=False,
-    )
-    # Routing wrappers may preserve or discard an incoming provider-owned
-    # continuation independently of the final fallback error's retry policy.
-    preserve_provider_state_on_error: bool | None = field(default=None, repr=False)
     # Structured error metadata used by retry policy when finish_reason == "error".
     error_status_code: int | None = None
     error_kind: str | None = None  # e.g. "timeout", "connection"
@@ -554,18 +492,6 @@ class LLMProvider(ABC):
         self.api_base = api_base
         self.provider_name = provider_name
         self.generation: GenerationSettings = GenerationSettings()
-
-    def can_resume_conversation_state(
-        self,
-        state: ProviderConversationState,
-        model: str | None = None,
-    ) -> bool:
-        """Whether this provider can safely consume an opaque saved state."""
-        return False
-
-    def supports_pre_request_compaction(self, model: str | None = None) -> bool:
-        """Whether the provider enforces compaction_input_budget before generation."""
-        return False
 
     async def model_limits(self, model: str) -> ModelLimits:
         """The limits `model` has at this provider; unknown for a provider that publishes none."""
@@ -980,21 +906,6 @@ class LLMProvider(ABC):
         return result if found else None
 
     @staticmethod
-    def _contains_image_content(value: object) -> bool:
-        """Return whether a JSON-like provider payload contains an input image."""
-        if isinstance(value, dict):
-            mapping = cast(dict[str, object], value)
-            if mapping.get("type") in {"image_url", "input_image"}:
-                return True
-            return any(LLMProvider._contains_image_content(item) for item in mapping.values())
-        if isinstance(value, list):
-            return any(
-                LLMProvider._contains_image_content(item)
-                for item in cast(list[object], value)
-            )
-        return False
-
-    @staticmethod
     def _strip_image_content_inplace(messages: list[dict[str, Any]]) -> bool:
         """Replace image_url blocks with text placeholder *in-place*.
 
@@ -1340,35 +1251,12 @@ class LLMProvider(ABC):
             last_response = response
             if not self.is_transient_response(response):
                 stripped = self._strip_image_content(kw["messages"])
-                provider_context = kw.get("provider_context")
-                stripped_context: ProviderCallContext | None = None
-                if isinstance(provider_context, ProviderCallContext):
-                    state = provider_context.conversation_state
-                    if state is not None and (
-                        stripped is not None
-                        or self._strip_image_content(state.pending_messages) is not None
-                        or self._contains_image_content(state.payload)
-                    ):
-                        # Provider-owned payloads may retain earlier input_image items.
-                        # Rebuild from the stripped public transcript for this retry.
-                        stripped_context = ProviderCallContext(
-                            context_window_tokens=(
-                                provider_context.context_window_tokens
-                            ),
-                            session_id=provider_context.session_id,
-                            events=provider_context.events,
-                            response_preset=provider_context.response_preset,
-                            response_is_fallback=provider_context.response_is_fallback,
-                        )
-                if stripped is not None or stripped_context is not None:
+                if stripped is not None:
                     logger.warning(
                         "Non-transient LLM error with image content, retrying without images"
                     )
                     retry_kw = dict(kw)
-                    if stripped is not None:
-                        retry_kw["messages"] = stripped
-                    if stripped_context is not None:
-                        retry_kw["provider_context"] = stripped_context
+                    retry_kw["messages"] = stripped
                     result = await call(**retry_kw)
                     # Permanently strip images from the original messages so
                     # subsequent iterations do not repeat the error-retry cycle.

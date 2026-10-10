@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -21,17 +21,7 @@ from loguru import logger
 
 from nanobot.agent.context import TranscriptInput
 from nanobot.events import NO_EVENTS, ContextCompactionEvent, EventSink
-from nanobot.providers.base import (
-    CONTEXT_SAFETY_BUFFER,
-    LLMResponse,
-    LLMUsage,
-    ProviderCallContext,
-    ProviderConversationState,
-)
-from nanobot.providers.conversation_state import (
-    ProviderConversationStateController,
-    allows_conversation_message_merge,
-)
+from nanobot.providers.base import CONTEXT_SAFETY_BUFFER, LLMUsage
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.summary import (
     SUMMARY_CONTINUATION_TEXT,
@@ -53,10 +43,6 @@ TranscriptBuilder = Callable[[TranscriptInput], list[dict[str, Any]]]
 SummaryTranscriptBuilder = Callable[[str], list[dict[str, Any]]]
 HistoryConsolidator = Callable[
     [list[dict[str, Any]], str | None],
-    Awaitable[str | None],
-]
-ProviderCompactionConsolidator = Callable[
-    [ProviderConversationState, list[dict[str, Any]], str | None],
     Awaitable[str | None],
 ]
 
@@ -158,7 +144,6 @@ class ContextCompactionState:
     active_summary: str | None
     summary_transcript_builder: SummaryTranscriptBuilder
     consolidate_history: HistoryConsolidator
-    consolidate_provider_compaction: ProviderCompactionConsolidator | None
     summary_checkpoint: SessionSummaryCheckpoint | None = None
 
     @classmethod
@@ -167,7 +152,6 @@ class ContextCompactionState:
         transcript_input: TranscriptInput,
         transcript_builder: TranscriptBuilder,
         consolidate_history: HistoryConsolidator,
-        consolidate_provider_compaction: ProviderCompactionConsolidator | None,
     ) -> tuple[list[dict[str, Any]], ContextCompactionState]:
         """Build the raw transcript and its initial H/delta boundary."""
         messages = list(transcript_builder(transcript_input))
@@ -197,7 +181,6 @@ class ContextCompactionState:
             ),
             summary_transcript_builder=build_summary_transcript,
             consolidate_history=consolidate_history,
-            consolidate_provider_compaction=consolidate_provider_compaction,
         )
 
     def request_messages(
@@ -231,13 +214,10 @@ class ModelRequestState:
     """Context state shared by every provider request in one runner turn."""
 
     config: ContextGovernanceConfig
-    conversation: ProviderConversationStateController
     compaction: ContextCompactionState
     usage: LLMUsage | None = None
     messages: list[dict[str, Any]] | None = None
     tool_definitions: list[dict[str, Any]] | None = None
-    provider_compaction_applied: bool = False
-    compacted_tool_results: set[str] = field(default_factory=set)
     events: EventSink = NO_EVENTS
     # The answer limit of the request prepare_request prepared last (None: no limit is known, none is sent).
     answer_tokens: int | None = None
@@ -282,8 +262,6 @@ class ContextGovernor:
                 and prepared[-1].get("content") != SUMMARY_CONTINUATION_TEXT
                 and not is_hidden_history_message(injection)
                 and not is_hidden_history_message(prepared[-1])
-                and allows_conversation_message_merge(injection)
-                and allows_conversation_message_merge(prepared[-1])
             ):
                 merged = dict(prepared[-1])
                 merged["content"] = cls._merge_message_content(
@@ -341,27 +319,6 @@ class ContextGovernor:
             source=source,
         )
 
-    def request_pressure(
-        self,
-        config: ContextGovernanceConfig,
-        messages: list[dict[str, Any]],
-        usage: LLMUsage | None,
-        *,
-        usage_matches_messages: bool,
-        tool_definitions: list[dict[str, Any]] | None,
-        request_context_tokens: int | None = None,
-    ) -> tuple[int, str] | None:
-        """Return the authoritative measurement when a request is pressured."""
-        measurement = self.measure_request(
-            config,
-            messages,
-            usage,
-            usage_matches_messages=usage_matches_messages,
-            tool_definitions=tool_definitions,
-            request_context_tokens=request_context_tokens,
-        )
-        return measurement if self._pressured(config, measurement) else None
-
     def _pressured(self, config: ContextGovernanceConfig, measurement: tuple[int, str] | None) -> bool:
         budget = self.input_budget(config)
         return measurement is not None and not (budget > 0 and measurement[0] < budget)
@@ -374,15 +331,11 @@ class ContextGovernor:
         *,
         usage_matches_messages: bool,
         tool_definitions: list[dict[str, Any]] | None,
-        request_context_tokens: int | None = None,
     ) -> tuple[int, str] | None:
         """The prompt tokens of a request, from its authoritative source; None when the window is not known."""
         if not config.context_window_tokens:
             return None
-        if request_context_tokens is not None:
-            measured = request_context_tokens
-            source = "resumed provider state plus pending messages"
-        elif (
+        if (
             usage_matches_messages
             and usage is not None
             and usage.context_tokens is not None
@@ -405,87 +358,6 @@ class ContextGovernor:
     ) -> list[dict[str, Any]]:
         """Rebuild only the stable system prefix around a replacement summary."""
         return compaction.summary_transcript_builder(summary)
-
-    async def summarize_provider_compaction(
-        self,
-        state: ModelRequestState,
-        response: LLMResponse,
-        *,
-        current_request_boundary: int | None,
-    ) -> None:
-        """Materialize the exact input replaced by provider-native compaction."""
-        compaction = state.compaction
-        if response.provider_compaction_applied:
-            # Native compaction can omit results while the local transcript keeps
-            # their full text. They no longer prove what the model can read.
-            replaced_messages = (
-                compaction.accepted_messages
-                if response.provider_compaction_scope == "prior_context"
-                else state.messages or []
-            )
-            state.compacted_tool_results.update(
-                message["tool_call_id"] for message in replaced_messages
-                if message.get("role") == "tool"
-                and isinstance(message.get("tool_call_id"), str)
-            )
-        if (
-            not response.provider_compaction_applied
-            or response.provider_compaction_state is None
-            or compaction.consolidate_provider_compaction is None
-        ):
-            return
-
-        if response.provider_compaction_scope == "prior_context":
-            accepted_messages = compaction.accepted_messages
-            transcript_boundary = compaction.raw_accepted_boundary
-        elif (
-            response.provider_compaction_scope == "current_request"
-            and state.messages is not None
-            and current_request_boundary is not None
-        ):
-            accepted_messages = state.messages
-            transcript_boundary = current_request_boundary
-        else:
-            logger.warning(
-                "Ignoring provider compaction with missing request-boundary scope for {}",
-                state.config.session_key or "default",
-            )
-            return
-
-        compaction_id = uuid4().hex
-        await state.events.emit(
-            ContextCompactionEvent(compaction_id=compaction_id, phase="started"),
-        )
-        try:
-            summary = await compaction.consolidate_provider_compaction(
-                response.provider_compaction_state,
-                deepcopy(accepted_messages),
-                compaction.active_summary,
-            )
-        except (Exception, asyncio.CancelledError) as exc:
-            await state.events.emit(
-                ContextCompactionEvent(
-                    compaction_id=compaction_id,
-                    phase="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
-                ),
-            )
-            raise
-        if not summary:
-            await state.events.emit(
-                ContextCompactionEvent(compaction_id=compaction_id, phase="failed"),
-            )
-            return
-        compaction.active_summary = summary
-        compaction.summary_checkpoint = SessionSummaryCheckpoint(
-            summary=summary,
-            transcript_boundary=transcript_boundary,
-        )
-        await state.events.emit(
-            ContextCompactionEvent(
-                compaction_id=compaction_id,
-                phase="succeeded",
-            ),
-        )
 
     async def _compact_request_history(
         self,
@@ -536,10 +408,6 @@ class ContextGovernor:
                     *delta_messages,
                 ],
             )
-            # Responses-style state is append-only. Replacing H with a
-            # checkpoint requires a fresh request; a successful response may
-            # establish a new provider-owned state at the rewritten boundary.
-            state.conversation.replace_transcript(compaction.raw_messages)
             state.usage = None
             prepared = self.ensure_request_fits(
                 state.config,
@@ -572,23 +440,9 @@ class ContextGovernor:
         messages: list[dict[str, Any]],
         *,
         tool_definitions: list[dict[str, Any]] | None,
-        transcript: list[dict[str, Any]] | None = None,
-    ) -> tuple[list[dict[str, Any]], ProviderCallContext | None]:
+    ) -> list[dict[str, Any]]:
         """Prepare or compact and record the exact provider payload."""
         prepared = self.prepare_messages_for_model(state.config, messages)
-        model_messages: list[dict[str, Any]] | None = prepared
-        supplemental_messages: list[dict[str, Any]] | None = None
-        request_context_tokens = None
-        if transcript is not None:
-            if tool_definitions is None:
-                model_messages = None
-                supplemental_messages = [prepared[-1]]
-            request_context_tokens = state.conversation.estimate_request_context_tokens(
-                transcript,
-                model_messages=model_messages,
-                supplemental_messages=supplemental_messages,
-                tool_definitions=tool_definitions,
-            )
         usage_matches_messages = (
             state.messages is not None
             and prepared == state.messages
@@ -600,23 +454,10 @@ class ContextGovernor:
             state.usage,
             usage_matches_messages=usage_matches_messages,
             tool_definitions=tool_definitions,
-            request_context_tokens=request_context_tokens,
         )
         pressure = measurement if self._pressured(state.config, measurement) else None
         # The prompt the answer limit is figured from: this measurement, measured again if the request changes.
         prompt_tokens = measurement[0] if measurement is not None else 0
-        provider_context = (
-            state.conversation.prepare_request(
-                transcript,
-                context_window_tokens=state.config.context_window_tokens,
-                model_messages=model_messages,
-                supplemental_messages=supplemental_messages,
-            )
-            if transcript is not None
-            else state.conversation.independent_request_context(
-                context_window_tokens=state.config.context_window_tokens,
-            )
-        )
         if pressure is not None:
             # First the cheap step: clear old tool results. When the request then fits, no summary is written.
             cleared = self.clear_old_tool_results(prepared)
@@ -633,44 +474,18 @@ class ContextGovernor:
                     prepared = cleared
                     pressure = None
                     prompt_tokens = measured[0]
-                    state.conversation.replace_transcript(state.compaction.raw_messages)
                     state.usage = None
-                    provider_context = state.conversation.independent_request_context(
-                        context_window_tokens=state.config.context_window_tokens,
-                    )
         if pressure is not None:
-            input_budget = self.input_budget(state.config)
-            if (
-                input_budget > 0
-                and provider_context is not None
-                and provider_context.conversation_state is not None
-                and state.config.provider.supports_pre_request_compaction(state.config.model) is True
-            ):
-                # Keep the resumable state until its owner has compacted it. Inline
-                # server compaction alone cannot make an oversized request safe.
-                provider_context = replace(provider_context, compaction_input_budget=input_budget)
-                logger.info(
-                    "Request requires provider pre-request compaction for {}: tokens={} budget={} via {}",
-                    state.config.session_key or "default", pressure[0], input_budget, pressure[1],
-                )
-            else:
-                prepared = await self._compact_request_history(
-                    state,
-                    state.compaction,
-                    messages,
-                    pressure,
-                    tool_definitions=tool_definitions,
-                )
-                prompt_tokens = estimate_prompt_tokens_chain(
-                    state.config.provider, state.config.model, prepared, tool_definitions,
-                )[0]
-                provider_context = state.conversation.independent_request_context(
-                    context_window_tokens=state.config.context_window_tokens,
-                )
-        if state.events.publish is not None:
-            provider_context = replace(
-                provider_context or ProviderCallContext(), events=state.events,
+            prepared = await self._compact_request_history(
+                state,
+                state.compaction,
+                messages,
+                pressure,
+                tool_definitions=tool_definitions,
             )
+            prompt_tokens = estimate_prompt_tokens_chain(
+                state.config.provider, state.config.model, prepared, tool_definitions,
+            )[0]
         state.messages = deepcopy(prepared)
         state.tool_definitions = deepcopy(tool_definitions)
         state.answer_tokens = self.answer_tokens(state.config, prompt_tokens)
@@ -681,7 +496,7 @@ class ContextGovernor:
             measurement[1] if measurement is not None else "no window",
             state.answer_tokens,
         )
-        return prepared, provider_context
+        return prepared
 
     @staticmethod
     def input_budget(config: ContextGovernanceConfig) -> int:

@@ -14,8 +14,6 @@ from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
     LLMUsage,
-    ProviderCallContext,
-    ProviderConversationState,
     ToolCallRequest,
 )
 
@@ -271,115 +269,12 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 
 
 @pytest.mark.asyncio
-async def test_runner_replays_provider_state_without_chat_projection_duplicates():
-    from nanobot.agent.runner import AgentRunner
-
-    provider = MagicMock(spec=LLMProvider)
-    provider.can_resume_conversation_state.return_value = True
-    captured_second_kwargs: dict = {}
-    checkpoints: list[dict] = []
-    calls = 0
-
-    async def checkpoint(payload: dict) -> None:
-        checkpoints.append(payload)
-
-    first_state = ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="gpt-5.6",
-        version=1,
-        payload={"items": [{"type": "reasoning", "encrypted_content": "opaque"}]},
-    )
-    second_state = ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="gpt-5.6",
-        version=1,
-        payload={"items": [{"type": "message", "role": "assistant"}]},
-    )
-
-    async def chat_stream_with_retry(**kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            provider_context = kwargs["provider_context"]
-            assert isinstance(provider_context, ProviderCallContext)
-            assert provider_context.conversation_state is None
-            return LLMResponse(
-                content=None,
-                tool_calls=[
-                    ToolCallRequest(
-                        id="call_1|fc_1",
-                        name="list_dir",
-                        arguments={"path": "."},
-                    ),
-                ],
-                provider_state=first_state,
-            )
-        captured_second_kwargs.update(kwargs)
-        return LLMResponse(content="done", provider_state=second_state)
-
-    provider.chat_stream_with_retry = chat_stream_with_retry
-    tools = ScriptedTools(AsyncMock(return_value="tool result"), definitions=[])
-
-    result = await AgentRunner().run(make_run_spec(
-        provider,
-        initial_messages=[
-            {"role": "system", "content": "system"},
-            {"role": "user", "content": "do task"},
-        ],
-        tools=tools,
-        model="gpt-5.6",
-        max_iterations=3,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-        checkpoint_callback=checkpoint,
-    ))
-
-    provider_context = captured_second_kwargs["provider_context"]
-    assert isinstance(provider_context, ProviderCallContext)
-    assert provider_context.conversation_state is not None
-    assert provider_context.conversation_state.payload == first_state.payload
-    assert provider_context.conversation_state.pending_messages == [{
-        "role": "tool",
-        "tool_call_id": "call_1|fc_1",
-        "name": "list_dir",
-        "content": "tool result",
-    }]
-    assert not any(
-        message.get("role") == "assistant"
-        for message in provider_context.conversation_state.pending_messages
-    )
-    assert result.provider_state is not None
-    assert result.provider_state.payload == second_state.payload
-    assert result.provider_state.pending_messages == []
-    assert [checkpoint["phase"] for checkpoint in checkpoints] == [
-        "assistant_tool_calls",
-        "tool_result",
-        "final_response",
-    ]
-    assert checkpoints[1]["message"] == {
-        "role": "tool",
-        "tool_call_id": "call_1|fc_1",
-        "name": "list_dir",
-        "content": "tool result",
-    }
-
-
-@pytest.mark.asyncio
 async def test_runner_preserves_tool_result_before_rejecting_unfit_followup():
     from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
-    provider.can_resume_conversation_state.return_value = True
     calls = 0
     checkpoints: list[dict] = []
-    state = ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="gpt-5.6",
-        version=1,
-        payload={"items": [{"type": "reasoning", "encrypted_content": "opaque"}]},
-    )
 
     async def chat_stream_with_retry(**kwargs):
         nonlocal calls
@@ -394,7 +289,6 @@ async def test_runner_preserves_tool_result_before_rejecting_unfit_followup():
                         arguments={"path": "large.txt"},
                     ),
                 ],
-                provider_state=state,
             )
         return LLMResponse(content="done")
 
@@ -439,24 +333,9 @@ async def test_injected_final_response_is_committed_before_the_injected_message(
     from nanobot.agent.runner import AgentRunner
 
     provider = MagicMock(spec=LLMProvider)
-    provider.can_resume_conversation_state.return_value = True
-    first_state = ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="gpt-5.6",
-        version=1,
-        payload={"items": [{"type": "message", "content": "first answer"}]},
-    )
-    second_state = ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="gpt-5.6",
-        version=1,
-        payload={"items": [{"type": "message", "content": "second answer"}]},
-    )
     provider.chat_stream_with_retry = AsyncMock(side_effect=[
-        LLMResponse(content="first answer", provider_state=first_state),
-        LLMResponse(content="second answer", provider_state=second_state),
+        LLMResponse(content="first answer"),
+        LLMResponse(content="second answer"),
     ])
     tools = MagicMock()
     tools.get_definitions.return_value = []
@@ -487,85 +366,6 @@ async def test_injected_final_response_is_committed_before_the_injected_message(
         ("injected_user", "user", "follow up"),
         ("final_response", "assistant", "second answer"),
     ]
-
-
-@pytest.mark.asyncio
-async def test_runner_preserves_last_completed_provider_state_on_model_error():
-    from nanobot.agent.runner import AgentRunner
-
-    provider = MagicMock(spec=LLMProvider)
-    provider.can_resume_conversation_state.return_value = True
-    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
-        content="temporary upstream failure",
-        finish_reason="error",
-        error_kind="timeout",
-    ))
-    tools = MagicMock()
-    tools.get_definitions.return_value = []
-    state = ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="gpt-5.6",
-        version=1,
-        payload={"items": [{"type": "reasoning", "encrypted_content": "opaque"}]},
-    )
-    unsaved_input = {"role": "user", "content": "ephemeral follow-up"}
-
-    result = await AgentRunner().run(make_run_spec(
-        provider,
-        initial_messages=[
-            {"role": "system", "content": "system"},
-            unsaved_input,
-        ],
-        tools=tools,
-        model="gpt-5.6",
-        max_iterations=1,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-        provider_state=state.with_pending_messages([unsaved_input]),
-    ))
-
-    assert result.stop_reason == "error"
-    assert result.provider_state is not None
-    assert result.provider_state.payload == state.payload
-    assert result.provider_state.pending_messages[0] == unsaved_input
-    assert result.provider_state.pending_messages[1]["role"] == "assistant"
-    assert "model error" in result.provider_state.pending_messages[1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_runner_discards_provider_state_on_non_retryable_model_error():
-    from nanobot.agent.runner import AgentRunner
-
-    provider = MagicMock(spec=LLMProvider)
-    provider.can_resume_conversation_state.return_value = True
-    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
-        content="context length exceeded",
-        finish_reason="error",
-        error_status_code=400,
-        error_should_retry=False,
-    ))
-    tools = MagicMock()
-    tools.get_definitions.return_value = []
-    state = ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="gpt-5.6",
-        version=1,
-        payload={"items": [{"type": "reasoning", "encrypted_content": "opaque"}]},
-    )
-
-    result = await AgentRunner().run(make_run_spec(
-        provider,
-        initial_messages=[{"role": "user", "content": "continue"}],
-        tools=tools,
-        model="gpt-5.6",
-        max_iterations=1,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-        provider_state=state,
-    ))
-
-    assert result.stop_reason == "error"
-    assert result.provider_state is None
 
 
 @pytest.mark.asyncio
@@ -746,25 +546,10 @@ async def test_runner_uses_specific_message_after_empty_finalization_retry():
 
 
 @pytest.mark.asyncio
-async def test_empty_finalization_retry_discards_candidate_provider_state():
+async def test_empty_finalization_retry_runs_no_tool_it_returns():
     from nanobot.agent.runner import AgentRunner
 
-    candidate = ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="test-model",
-        version=1,
-        payload={
-            "items": [{
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "exec",
-                "arguments": "{}",
-            }],
-        },
-    )
     provider = MagicMock(spec=LLMProvider)
-    provider.can_resume_conversation_state.return_value = True
     provider.chat_stream_with_retry = AsyncMock(side_effect=[
         LLMResponse(content=None, tool_calls=[], usage=None),
         LLMResponse(content=None, tool_calls=[], usage=None),
@@ -772,7 +557,6 @@ async def test_empty_finalization_retry_discards_candidate_provider_state():
             content="finalized without tools",
             tool_calls=[ToolCallRequest(id="call_1", name="exec", arguments={})],
             finish_reason="stop",
-            provider_state=candidate,
             usage=None,
         ),
     ])
@@ -790,7 +574,6 @@ async def test_empty_finalization_retry_discards_candidate_provider_state():
 
     tools.execute.assert_not_awaited()
     assert result.final_content == "finalized without tools"
-    assert result.provider_state is None
 
 
 @pytest.mark.asyncio

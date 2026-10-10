@@ -15,7 +15,6 @@ from nanobot.agent.memory import (
 from nanobot.providers.base import (
     GenerationSettings,
     LLMResponse,
-    ProviderConversationState,
     ToolCallRequest,
 )
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -44,16 +43,6 @@ def runtime(mock_provider):
 @pytest.fixture
 def consolidator():
     return Consolidator()
-
-
-def _provider_state() -> ProviderConversationState:
-    return ProviderConversationState(
-        kind="openai_responses",
-        provider="openai:test",
-        model="test-model",
-        version=1,
-        payload={"items": []},
-    )
 
 
 async def _archive(
@@ -135,7 +124,7 @@ class TestTurnTranscriptSummary:
         assert "[RAW]" in result
         assert "accepted history" in result
 
-    async def test_native_compaction_appends_only_archive_prompt(
+    async def test_a_tool_call_is_answered_and_the_checkpoint_asked_for_again(
         self,
         consolidator,
         mock_provider,
@@ -143,86 +132,39 @@ class TestTurnTranscriptSummary:
     ):
         accepted = [
             {"role": "system", "content": "stable system"},
-            {"role": "user", "content": "raw history must not be replayed"},
+            {"role": "user", "content": "accepted history"},
         ]
-        state = _provider_state()
-        mock_provider.can_resume_conversation_state.return_value = True
-        mock_provider.chat_stream_with_retry.return_value = LLMResponse(
-            content="replacement checkpoint",
-        )
-
-        result = await consolidator.summarize_provider_compaction(
-            state,
-            accepted,
-            "previous checkpoint",
-            runtime=runtime,
-            session_key="test:turn",
-            tools=[{"type": "function", "function": {"name": "inspect"}}],
-        )
-
-        assert result == "replacement checkpoint\n\n## The person's latest messages, as they wrote them\n\nraw history must not be replayed"
-        call = mock_provider.chat_stream_with_retry.await_args.kwargs
-        assert call["messages"][0] == accepted[0]
-        assert call["messages"][-1]["content"] == _ARCHIVE_PROMPT
-        assert accepted[1] not in call["messages"]
-        assert call["tools"] == []
-        provider_context = call["provider_context"]
-        assert provider_context.conversation_state is not None
-        assert provider_context.conversation_state.payload == state.payload
-        assert provider_context.conversation_state.pending_messages == [
-            call["messages"][-1],
-        ]
-
-    async def test_native_compaction_recovers_tool_call_from_response_state(
-        self,
-        consolidator,
-        mock_provider,
-        runtime,
-    ):
-        accepted = [
-            {"role": "system", "content": "stable system"},
-            {"role": "user", "content": "raw history must not be replayed"},
-        ]
-        incoming_state = _provider_state()
-        response_state = ProviderConversationState(
-            kind="openai_responses",
-            provider="openai:test",
-            model="test-model",
-            version=1,
-            payload={"items": [{"type": "function_call", "call_id": "call-1"}]},
-        )
-        mock_provider.can_resume_conversation_state.return_value = True
+        tools = [{"type": "function", "function": {"name": "inspect"}}]
         mock_provider.chat_stream_with_retry.side_effect = [
             LLMResponse(
                 content=None,
                 tool_calls=[ToolCallRequest(id="call-1", name="inspect", arguments={})],
                 finish_reason="tool_calls",
-                provider_state=response_state,
             ),
             LLMResponse(content="replacement checkpoint", finish_reason="stop"),
         ]
 
-        result = await consolidator.summarize_provider_compaction(
-            incoming_state,
+        result = await consolidator.summarize_transcript(
             accepted,
             "previous checkpoint",
             runtime=runtime,
             session_key="test:turn",
-            tools=[{"type": "function", "function": {"name": "inspect"}}],
+            tools=tools,
         )
 
-        assert result == "replacement checkpoint\n\n## The person's latest messages, as they wrote them\n\nraw history must not be replayed"
+        assert result == "replacement checkpoint\n\n## The person's latest messages, as they wrote them\n\naccepted history"
         first_call, recovery_call = mock_provider.chat_stream_with_retry.await_args_list
-        assert first_call.kwargs["tools"] == recovery_call.kwargs["tools"] == []
-        recovery_context = recovery_call.kwargs["provider_context"]
-        assert recovery_context.conversation_state is not None
-        assert recovery_context.conversation_state.payload == response_state.payload
-        assert recovery_context.conversation_state.pending_messages == [{
+        assert first_call.kwargs["tools"] == recovery_call.kwargs["tools"] == tools
+        assert first_call.kwargs["messages"] == [*accepted, {"role": "user", "content": _ARCHIVE_PROMPT}]
+        assistant, tool_result = recovery_call.kwargs["messages"][-2:]
+        assert assistant["role"] == "assistant"
+        assert [call["id"] for call in assistant["tool_calls"]] == ["call-1"]
+        assert tool_result == {
             "role": "tool",
             "tool_call_id": "call-1",
             "name": "inspect",
             "content": _ARCHIVE_TOOL_RESULT,
-        }]
+        }
 
 
 class TestConsolidatorSummarize:

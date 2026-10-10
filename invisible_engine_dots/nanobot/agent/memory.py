@@ -13,8 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 from loguru import logger
 
 from nanobot.agent.context_governance import answer_limit, prompt_budget
-from nanobot.providers.base import LLMResponse, ProviderConversationState
-from nanobot.providers.conversation_state import ProviderConversationStateController
+from nanobot.providers.base import LLMResponse
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.summary import SUMMARY_CONTINUATION_TEXT
 from nanobot.utils.helpers import (
@@ -173,7 +172,6 @@ class Consolidator:
         previous_summary: str | None = None,
         input_token_budget: int | None = None,
         fallback_max_tokens: int | None = None,
-        provider_state: ProviderConversationState | None = None,
     ) -> str | None:
         """Generate a replacement checkpoint; fall back to a mechanical one."""
         if not source_messages:
@@ -192,46 +190,19 @@ class Consolidator:
             archive_count=len(source_messages),
         )
         prompt_message = {"role": "user", "content": prompt}
-        provider_context = None
-        state_controller: ProviderConversationStateController | None = None
-        state_messages: list[dict[str, Any]] = []
-        call_tools = request_tools
-        if provider_state is not None:
-            instruction_messages: list[dict[str, Any]] = []
-            for message in history:
-                if message.get("role") not in {"system", "developer"}:
-                    break
-                instruction_messages.append(dict(message))
-            request_messages = [*instruction_messages, prompt_message]
-            state_controller = ProviderConversationStateController(
-                provider=runtime.provider,
-                model=runtime.model,
-                messages=state_messages,
-                state=provider_state,
-                session_id=session_key,
-            )
-            state_messages.append(dict(prompt_message))
-            provider_context = state_controller.prepare_request(
-                state_messages,
-                context_window_tokens=runtime.context_window_tokens,
-            )
-            if provider_context is None or provider_context.conversation_state is None:
-                return raw_fallback()
-            call_tools = []
-        else:
-            request_messages = [
-                *[dict(message) for message in history],
-                prompt_message,
-            ]
+        request_messages = [
+            *[dict(message) for message in history],
+            prompt_message,
+        ]
         estimated = 0
-        if input_token_budget and provider_context is None:
+        if input_token_budget:
             # Too long for the summary model: the oldest messages go, one at a time with the results of their
             # calls, until the rest fits (Codex drops its oldest item and tries again).
             estimated, source = estimate_prompt_tokens_chain(
                 runtime.provider,
                 runtime.model,
                 request_messages,
-                call_tools,
+                request_tools,
             )
             while estimated > input_token_budget:
                 # Each message's own estimate says how many to drop; the whole is measured again after.
@@ -253,7 +224,7 @@ class Consolidator:
                     runtime.provider,
                     runtime.model,
                     request_messages,
-                    call_tools,
+                    request_tools,
                 )
 
         response: LLMResponse | None = None
@@ -262,11 +233,10 @@ class Consolidator:
                 response = await runtime.provider.chat_stream_with_retry(
                     model=runtime.model,
                     messages=request_messages,
-                    tools=call_tools,
+                    tools=request_tools,
                     temperature=runtime.generation.temperature,
                     max_tokens=answer_limit(runtime.context_window_tokens, runtime.generation.max_tokens, estimated),
                     reasoning_effort=runtime.generation.reasoning_effort,
-                    provider_context=provider_context,
                 )
             except Exception:
                 phase = "provider call" if attempt == 0 else "tool-call recovery"
@@ -302,24 +272,6 @@ class Consolidator:
                 assistant_message,
                 *tool_messages,
             ]
-            if state_controller is not None:
-                state_controller.observe_response(
-                    response,
-                    state_messages,
-                )
-                state_messages.extend([
-                    state_controller.project_response_message(
-                        dict(assistant_message),
-                        response,
-                    ),
-                    *[dict(message) for message in tool_messages],
-                ])
-                provider_context = state_controller.prepare_request(
-                    state_messages,
-                    context_window_tokens=runtime.context_window_tokens,
-                )
-                if provider_context is None or provider_context.conversation_state is None:
-                    return raw_fallback()
         assert response is not None
         if response.finish_reason in {"error", "length"}:
             logger.warning(
@@ -350,7 +302,6 @@ class Consolidator:
         runtime: LLMRuntime,
         session_key: str,
         tools: list[dict[str, Any]],
-        provider_state: ProviderConversationState | None = None,
         recent_user_tokens: int = RECENT_USER_MESSAGE_TOKENS,
     ) -> str | None:
         """Summarize the exact transcript prefix already accepted by the model; the person's latest messages, up to
@@ -375,28 +326,7 @@ class Consolidator:
             previous_summary=previous_summary,
             input_token_budget=input_token_budget,
             fallback_max_tokens=input_token_budget // 2 or None,
-            provider_state=provider_state,
         )
         if summary is None:
             return None
         return _with_recent_user_messages(summary, source_messages, recent_user_tokens)
-
-    async def summarize_provider_compaction(
-        self,
-        state: ProviderConversationState,
-        fallback_messages: list[dict[str, Any]],
-        previous_summary: str | None,
-        *,
-        runtime: LLMRuntime,
-        session_key: str,
-        tools: list[dict[str, Any]],
-    ) -> str | None:
-        """Prompt a native compacted state without replaying its raw history."""
-        return await self.summarize_transcript(
-            fallback_messages,
-            previous_summary,
-            runtime=runtime,
-            session_key=session_key,
-            tools=tools,
-            provider_state=state,
-        )

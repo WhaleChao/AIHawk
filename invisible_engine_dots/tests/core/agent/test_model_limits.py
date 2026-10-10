@@ -25,7 +25,6 @@ from nanobot.agent.context_governance import (
     prompt_budget,
 )
 from nanobot.providers.base import CONTEXT_SAFETY_BUFFER, LLMProvider
-from nanobot.providers.conversation_state import ProviderConversationStateController
 
 
 @pytest.mark.parametrize(
@@ -118,9 +117,8 @@ def _request_state(messages: list[dict[str, Any]], window: int, longest_answer: 
         max_tool_result_chars=1_000_000,
         consolidate_history=consolidate,
     )
-    transcript = spec.transcript_builder(spec.transcript_input)
     _, compaction = ContextCompactionState.from_transcript(
-        spec.transcript_input, spec.transcript_builder, spec.consolidate_history, None,
+        spec.transcript_input, spec.transcript_builder, spec.consolidate_history,
     )
     return ModelRequestState(
         config=ContextGovernanceConfig(
@@ -133,7 +131,6 @@ def _request_state(messages: list[dict[str, Any]], window: int, longest_answer: 
             context_window_tokens=window,
             max_tokens=longest_answer,
         ),
-        conversation=ProviderConversationStateController(provider=provider, model="m", messages=transcript),
         compaction=compaction,
     )
 
@@ -147,7 +144,7 @@ async def test_a_request_over_the_window_that_fits_once_old_results_are_cleared_
     messages = _tool_turns(10, 10_000)
     state = _request_state(messages, window=100_000, longest_answer=64_000, consolidate=consolidate)
 
-    prepared, _ = await ContextGovernor().prepare_request(state, messages, tool_definitions=[])
+    prepared = await ContextGovernor().prepare_request(state, messages, tool_definitions=[])
 
     consolidate.assert_not_awaited()
     assert [m["content"] for m in prepared if m["role"] == "tool"][:6] == [CLEARED_TOOL_RESULT] * 6
@@ -175,7 +172,7 @@ async def test_a_request_under_the_window_is_sent_as_it_is_with_the_longest_answ
     messages = _tool_turns(2, 1_000)
     state = _request_state(messages, window=1_000_000, longest_answer=64_000, consolidate=consolidate)
 
-    prepared, _ = await ContextGovernor().prepare_request(state, messages, tool_definitions=[])
+    prepared = await ContextGovernor().prepare_request(state, messages, tool_definitions=[])
 
     consolidate.assert_not_awaited()
     assert CLEARED_TOOL_RESULT not in [m.get("content") for m in prepared]

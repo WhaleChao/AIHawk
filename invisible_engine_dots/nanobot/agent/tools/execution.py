@@ -64,7 +64,6 @@ async def execute_tool_calls(
     context: AgentHookContext,
     gate: ToolGate,
     model_messages: list[dict[str, Any]] | None = None,
-    compacted_tool_results: set[str] | None = None,
     on_result: ResultCallback | None = None,
 ) -> tuple[list[Any], list[dict[str, str]]]:
     """Execute one model response's tool calls in stable result order.
@@ -85,7 +84,6 @@ async def execute_tool_calls(
             if message.get("role") == "tool"
             and isinstance(message.get("tool_call_id"), str)
             and isinstance(message.get("content"), str)
-            and message["tool_call_id"] not in (compacted_tool_results or ())
         }
     tool_results: list[_Outcome] = []
     parked = False
